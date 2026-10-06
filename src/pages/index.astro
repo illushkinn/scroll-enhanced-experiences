@@ -1,0 +1,185 @@
+---
+import Layout from '../layouts/Layout.astro';
+import ScrollStage from '../components/ScrollStage.astro';
+
+const title = 'Maravilla — Pre-Construction Residences on the Coast';
+const description =
+  'Scroll through the making of Maravilla: a golden-hour plot, a blueprint, a rising structure, a finished tower, and a penthouse above the ocean.';
+
+interface Scene {
+  kicker: string;
+  heading: string;
+  line: string;
+  align: 'left' | 'right' | 'center';
+  row: 'top' | 'bottom';
+  start: number;
+  end: number;
+}
+
+const scenes: Scene[] = [
+  {
+    kicker: '01 · The Plot',
+    heading: 'The Plot',
+    line: 'A golden acre above the Pacific, held for a decade for what comes next.',
+    align: 'left',
+    row: 'bottom',
+    start: -0.05,
+    end: 0.2,
+  },
+  {
+    kicker: '02 · The Plans',
+    heading: 'The Plans',
+    line: 'Blueprint lines rise from the survey markers.',
+    align: 'right',
+    row: 'top',
+    start: 0.24,
+    end: 0.44,
+  },
+  {
+    kicker: '03 · The Vision',
+    heading: 'The Vision',
+    line: 'Salt, steel and a promise rising with the tide.',
+    align: 'center',
+    row: 'bottom',
+    start: 0.46,
+    end: 0.64,
+  },
+  {
+    kicker: '04 · The Tower',
+    heading: 'The Tower',
+    line: 'Forty storeys of glass holding the last light.',
+    align: 'right',
+    row: 'bottom',
+    start: 0.66,
+    end: 0.82,
+  },
+  {
+    kicker: '05 · The Penthouse',
+    heading: 'The Penthouse',
+    line: 'The horizon, uninterrupted, from bed to balcony.',
+    align: 'left',
+    row: 'top',
+    start: 0.86,
+    end: 1.1,
+  },
+];
+
+const siteURL = Astro.site ?? new URL('https://maravilla.example.com');
+const canonicalURL = new URL(Astro.url.pathname, siteURL);
+const posterURL = new URL('/media/poster.jpg', siteURL);
+
+const structuredData = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'ApartmentComplex',
+      '@id': `${canonicalURL}#development`,
+      name: 'Maravilla',
+      description:
+        'A pre-construction residential tower on the coast, from empty plot to penthouse.',
+      url: canonicalURL.href,
+      image: posterURL.href,
+      logo: posterURL.href,
+      slogan: 'A decade in the making.',
+      publicAccess: false,
+      isAccessibleForFree: false,
+      amenityFeature: [
+        {
+          '@type': 'LocationFeatureSpecification',
+          name: 'Ocean view',
+          value: true,
+        },
+      ],
+    },
+    {
+      '@type': 'Residence',
+      '@id': `${canonicalURL}#penthouse`,
+      name: 'Maravilla — The Penthouse',
+      description:
+        'A full-floor penthouse with an uninterrupted ocean horizon from bed to balcony.',
+      url: canonicalURL.href,
+      image: posterURL.href,
+      floorLevel: '40',
+      containedInPlace: { '@id': `${canonicalURL}#development` },
+      amenityFeature: [
+        {
+          '@type': 'LocationFeatureSpecification',
+          name: 'Private terrace',
+          value: true,
+        },
+      ],
+    },
+    {
+      '@type': 'Organization',
+      '@id': `${canonicalURL}#developer`,
+      name: 'Maravilla Development',
+      url: canonicalURL.href,
+    },
+    {
+      '@type': 'WebPage',
+      '@id': canonicalURL.href,
+      url: canonicalURL.href,
+      name: title,
+      description,
+      inLanguage: 'en',
+      about: { '@id': `${canonicalURL}#development` },
+      isPartOf: { '@id': `${canonicalURL}#development` },
+      primaryImageOfPage: posterURL.href,
+    },
+  ],
+};
+---
+
+<Layout title={title} description={description}>
+  <Fragment slot="head">
+    <script
+      is:inline
+      type="application/ld+json"
+      set:html={JSON.stringify(structuredData)}
+    />
+  </Fragment>
+
+  <nav class="nav" aria-label="Primary">
+    <a class="nav__brand" href="/">Maravilla</a>
+    <button class="nav__menu" type="button" aria-label="Open menu">
+      <svg
+        width="26"
+        height="14"
+        viewBox="0 0 26 14"
+        fill="none"
+        aria-hidden="true"
+        focusable="false"
+      >
+        <path d="M0 1h26M0 13h26" stroke="currentColor" stroke-width="1.5"></path>
+      </svg>
+    </button>
+  </nav>
+
+  <ScrollStage>
+    {
+      scenes.map((scene) => (
+        <article
+          class:list={[
+            'scene',
+            `scene--${scene.align}`,
+            `scene--${scene.row}`,
+          ]}
+          data-start={scene.start}
+          data-end={scene.end}
+        >
+          <div class="scene__body">
+            <span class="scene__kicker">{scene.kicker}</span>
+            <h2 class="scene__title">{scene.heading}</h2>
+            <p class="scene__line">{scene.line}</p>
+          </div>
+        </article>
+      ))
+    }
+  </ScrollStage>
+
+  <script>
+    import { initScrollStage } from '../lib/scroll';
+
+    initScrollStage();
+  </script>
+</Layout>

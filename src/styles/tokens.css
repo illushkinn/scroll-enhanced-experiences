@@ -1,0 +1,35 @@
+:root {
+  color-scheme: dark;
+
+  --color-night: oklch(0.17 0.02 265);
+  --color-night-deep: oklch(0.11 0.015 265);
+  --color-night-soft: oklch(0.24 0.025 265);
+
+  --color-amber: oklch(0.78 0.15 72);
+  --color-amber-soft: oklch(0.9 0.08 85);
+
+  --color-cyan: oklch(0.78 0.11 220);
+  --color-cyan-soft: oklch(0.9 0.06 215);
+
+  --color-ink: oklch(0.97 0.01 95);
+  --color-ink-muted: oklch(0.82 0.02 95);
+  --color-veil: oklch(0.11 0.015 265 / 0.62);
+
+  --font-display: "Didot", "Bodoni MT", "Playfair Display", "Times New Roman",
+    serif;
+  --font-body: "Inter", "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
+
+  --nav-padding: 40px;
+  --scene-inset: 8%;
+  --scene-inset-mobile: 10%;
+
+  --step-heading: clamp(2rem, 3.4vw + 1rem, 4rem);
+  --step-body: clamp(1rem, 0.4vw + 0.9rem, 1.25rem);
+  --step-kicker: clamp(0.6875rem, 0.2vw + 0.65rem, 0.8125rem);
+
+  --track-kicker: 0.32em;
+  --track-display: -0.02em;
+
+  --scene-rise: 30px;
+  --scene-fade: 420ms;
+}

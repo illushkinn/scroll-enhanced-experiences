@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Maravilla">
+  <title>Maravilla</title>
+  <!-- token: color-night (tile) -->
+  <rect width="64" height="64" rx="14" fill="#0B0F18" />
+  <!-- token: color-amber (sun on the horizon) -->
+  <path d="M17 29a15 15 0 0 1 30 0Z" fill="#F2A635" />
+  <rect x="6" y="29" width="52" height="3" rx="1.5" fill="#F2A635" />
+  <!-- token: color-cyan (the sea) -->
+  <path
+    d="M10 43.5q7-7 14 0t14 0t14 0"
+    fill="none"
+    stroke="#59C8E8"
+    stroke-width="4.5"
+    stroke-linecap="round"
+  />
+</svg>
