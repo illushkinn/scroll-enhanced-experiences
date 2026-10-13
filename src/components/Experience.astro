@@ -1,0 +1,304 @@
+---
+import { content, otherLocale, type Locale } from '../i18n/content';
+import { stops, connectors, connectorsMobile, pacing } from '../data/world';
+
+interface Props {
+  locale: Locale;
+}
+
+const { locale } = Astro.props;
+const t = content[locale];
+const other = content[otherLocale(locale)];
+
+const sections = stops.map((stop, i) => ({
+  ...stop,
+  ...t.stops[stop.id],
+  titleTag: i === 0 ? 'h1' : 'h2',
+}));
+
+// Everything the engine needs, serialised for the client script below.
+const config = {
+  hint: t.hint,
+  nav: false,
+  atmosphere: false,
+  stillMotion: false,
+  connScroll: pacing.connScroll,
+  crossfade: pacing.crossfade,
+  sections,
+  connectors,
+  connectorsMobile,
+};
+
+const pad = (n: number) => String(n).padStart(2, '0');
+---
+
+<header class="site-header">
+  <div>
+    <a class="nav__brand" href={t.path}>{t.brand}</a>
+    <p class="concept-badge">{t.concept}</p>
+  </div>
+  <!-- Language switch for the static (no-JS) version; with JS it lives in the menu. -->
+  <a
+    class="nav__lang"
+    href={other.path}
+    hreflang={other.htmlLang}
+    lang={other.htmlLang}
+  >
+    {t.menu.languageLabel}
+  </a>
+  <button
+    class="nav__menu"
+    type="button"
+    aria-expanded="false"
+    aria-controls="site-menu"
+    aria-label={t.menu.open}
+    data-menu-open
+  >
+    <svg
+      width="26"
+      height="14"
+      viewBox="0 0 26 14"
+      fill="none"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M0 1h26M0 13h26" stroke="currentColor" stroke-width="1.5"></path>
+    </svg>
+  </button>
+</header>
+
+<div class="menu" id="site-menu" hidden>
+  <div class="menu__backdrop" data-menu-close></div>
+  <div
+    class="menu__panel"
+    role="dialog"
+    aria-modal="true"
+    aria-label={t.menu.heading}
+  >
+    <div class="menu__top">
+      <p class="menu__heading">{t.menu.heading}</p>
+      <button
+        class="menu__close"
+        type="button"
+        aria-label={t.menu.close}
+        data-menu-close
+      >
+        <svg
+          width="18"
+          height="18"
+          viewBox="0 0 18 18"
+          fill="none"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <path d="M1 1l16 16M17 1L1 17" stroke="currentColor" stroke-width="1.5"
+          ></path>
+        </svg>
+      </button>
+    </div>
+    <nav aria-label={t.menu.heading}>
+      <ol class="menu__list">
+        {
+          sections.map((s, i) => (
+            <li>
+              <a class="menu__item" href={`#${s.id}`} data-stop={s.id}>
+                <span class="menu__num" aria-hidden="true">
+                  {pad(i + 1)}
+                </span>
+                {s.label}
+              </a>
+            </li>
+          ))
+        }
+      </ol>
+    </nav>
+    <a
+      class="menu__lang"
+      href={other.path}
+      hreflang={other.htmlLang}
+      lang={other.htmlLang}
+      data-lang-switch
+    >
+      {t.menu.languageLabel}
+    </a>
+  </div>
+</div>
+
+<main>
+<!-- Without JavaScript the engine never mounts: this stacked version carries
+     the same story and the page's h1. Hidden as soon as JS runs (html.js). -->
+<div class="story-static">
+  {
+    sections.map((s) => (
+      <section class="story-static__stop" id={s.id}>
+        <img
+          src={s.still}
+          alt=""
+          width="1912"
+          height="1080"
+          loading="lazy"
+          decoding="async"
+        />
+        <div>
+          <span class="story-static__eyebrow">{s.eyebrow}</span>
+          {s.titleTag === 'h1' ? (
+            <h1 class="story-static__title">{s.title}</h1>
+          ) : (
+            <h2 class="story-static__title">{s.title}</h2>
+          )}
+          <p class="story-static__body">{s.body}</p>
+        </div>
+      </section>
+    ))
+  }
+</div>
+
+<div id="world" data-config={JSON.stringify(config)}></div>
+</main>
+
+<script>
+  import { mountScrollWorld } from '../lib/scroll-world.js';
+
+  interface WorldApi {
+    jumpTo(target: number | string, opts?: { instant?: boolean }): boolean;
+  }
+
+  const root = document.getElementById('world');
+  const menu = document.getElementById('site-menu');
+  const openButton = document.querySelector<HTMLButtonElement>('[data-menu-open]');
+  const langSwitch = document.querySelector<HTMLAnchorElement>('[data-lang-switch]');
+  const items = Array.from(
+    document.querySelectorAll<HTMLAnchorElement>('.menu__item'),
+  );
+
+  let api: WorldApi | null = null;
+  let activeId = '';
+
+  // A malformed escape in a shared link must not break the rest of the script.
+  const hashId = () => {
+    const raw = location.hash.slice(1);
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  };
+
+  const config = root?.dataset.config ? JSON.parse(root.dataset.config) : null;
+  // Read ids from the config, not from `api`: the engine fires onActive for the
+  // first time while it is still mounting, before `api` is assigned.
+  const sectionIds: string[] = (config?.sections ?? []).map(
+    (s: { id: string }) => s.id,
+  );
+
+  const setActive = (index: number) => {
+    activeId = sectionIds[index] ?? '';
+    items.forEach((item) => {
+      if (item.dataset.stop === activeId) item.setAttribute('aria-current', 'step');
+      else item.removeAttribute('aria-current');
+    });
+    // Switching language keeps the visitor at the same stop.
+    if (langSwitch) {
+      const base = langSwitch.getAttribute('href')?.split('#')[0] ?? '/';
+      langSwitch.setAttribute('href', activeId ? `${base}#${activeId}` : base);
+    }
+  };
+
+  try {
+    if (!root || !config) throw new Error('scroll-world: missing config');
+    api = mountScrollWorld(root, {
+      ...config,
+      // A deep link (/#torre) starts the flight at that stop.
+      initialSection: hashId(),
+      onActive: setActive,
+    }) as WorldApi | null;
+    if (!api) throw new Error('scroll-world: nothing to mount');
+  } catch (error) {
+    // Fall back to the static story rather than an empty page.
+    document.documentElement.classList.remove('js');
+    console.error(error);
+  }
+
+  if (api) {
+    window.addEventListener('hashchange', () => {
+      const id = hashId();
+      if (id) api?.jumpTo(id);
+    });
+  }
+
+  // ---- menu ------------------------------------------------------------------
+
+  const focusables = () =>
+    Array.from(
+      menu?.querySelectorAll<HTMLElement>('a[href], button:not([disabled])') ?? [],
+    );
+
+  const isOpen = () => !!menu && !menu.hidden;
+
+  // While the dialog is open the rest of the page is inert, so focus (Tab,
+  // Shift+Tab from a non-focusable spot, Safari's link-skipping Tab) can't
+  // reach the controls hidden behind it.
+  const setOutsideInert = (inert: boolean) =>
+    document
+      .querySelectorAll<HTMLElement>('.site-header, main')
+      .forEach((el) => (el.inert = inert));
+
+  const openMenu = () => {
+    if (!menu || !openButton) return;
+    menu.hidden = false;
+    setOutsideInert(true);
+    document.documentElement.classList.add('is-menu-open');
+    openButton.setAttribute('aria-expanded', 'true');
+    const current = items.find((item) => item.dataset.stop === activeId);
+    (current ?? items[0])?.focus();
+  };
+
+  const closeMenu = (restoreFocus = true) => {
+    if (!menu || !openButton || menu.hidden) return;
+    menu.hidden = true;
+    setOutsideInert(false); // before focusing the (header) button again
+    document.documentElement.classList.remove('is-menu-open');
+    openButton.setAttribute('aria-expanded', 'false');
+    if (restoreFocus) openButton.focus();
+  };
+
+  openButton?.addEventListener('click', () => (isOpen() ? closeMenu() : openMenu()));
+
+  menu?.querySelectorAll('[data-menu-close]').forEach((el) =>
+    el.addEventListener('click', () => closeMenu()),
+  );
+
+  items.forEach((item) =>
+    item.addEventListener('click', (event) => {
+      if (!api) return; // no engine: let the anchor reach the static section
+      event.preventDefault();
+      const id = item.dataset.stop ?? '';
+      closeMenu(false);
+      openButton?.focus({ preventScroll: true });
+      history.replaceState(null, '', `#${id}`);
+      api.jumpTo(id);
+    }),
+  );
+
+  document.addEventListener('keydown', (event) => {
+    if (!isOpen()) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeMenu();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    // Keep focus inside the open dialog.
+    const list = focusables();
+    if (!list.length) return;
+    const first = list[0];
+    const last = list[list.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  });
+</script>

@@ -1,0 +1,48 @@
+---
+import { content, type Locale } from '../i18n/content';
+
+interface Props {
+  locale: Locale;
+}
+
+const { locale } = Astro.props;
+const t = content[locale];
+
+const siteURL = Astro.site ?? new URL('https://libertad-buildings.example.com');
+const pageURL = new URL(t.path, siteURL);
+const imageURL = new URL('/media/og.jpg', siteURL);
+
+// A concept piece, described as such: a creative work about a fictional
+// development — never a real ApartmentComplex/Residence listing.
+const structuredData = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'WebPage',
+      '@id': pageURL.href,
+      url: pageURL.href,
+      name: t.meta.title,
+      description: t.meta.description,
+      inLanguage: t.htmlLang,
+      primaryImageOfPage: imageURL.href,
+      mainEntity: { '@id': `${pageURL.href}#work` },
+    },
+    {
+      '@type': 'CreativeWork',
+      '@id': `${pageURL.href}#work`,
+      name: t.meta.title,
+      description: t.meta.description,
+      inLanguage: t.htmlLang,
+      image: imageURL.href,
+      genre: locale === 'es' ? 'Proyecto conceptual' : 'Concept project',
+      keywords: [t.brand, 'scroll', 'AI-generated imagery'],
+    },
+  ],
+};
+---
+
+<script
+  is:inline
+  type="application/ld+json"
+  set:html={JSON.stringify(structuredData)}
+/>
