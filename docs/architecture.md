@@ -54,12 +54,27 @@ src/pages/index.astro, src/pages/en/index.astro
   `src/i18n/content.ts` (all copy, per language), joined by stop `id`
   (`terreno`, `plano`, `obra`, `torre`, `penthouse`).
 - **Segments:** stop 0, clip 1, stop 1, … clip 4, stop 4. Each stop rests for
-  `scroll` viewport-heights (1.3 / 1 / 1 / 1 / 1.4); each clip takes
-  `connScroll` = 1.6. Total ≈ 13 viewports (the previous build had 4 for the
-  whole film, which is why it felt too fast).
+  `scroll` viewport-heights (1.3 / 1 / 1 / 1 / 1.4); the clips take
+  `connScroll` = 2 / 2.4 / 2.2 / 4.5. Total ≈ 17.8 viewports including the
+  closing one (the first build had 4 for the whole film). Under reduced motion
+  each clip band is capped at 1 viewport (it only holds a still).
+- **Pacing:** a clip does not move evenly (c2–c4 start at full speed; c4, the
+  fly-up into the penthouse, moves 10–20× more than the others, mostly in its
+  middle), so a linear scroll→time mapping feels abrupt. `scripts/time-maps.mjs`
+  measures each clip's frame-to-frame motion with ffmpeg and writes
+  `src/data/time-maps.json`: per clip, a 33-sample scroll→time table that
+  spreads the motion evenly over the band (75 % measured motion, 25 % plain
+  time) and ramps the speed up and down over the first and last 12 %, so the
+  camera leaves each stop from rest and settles into the next. Versus the first
+  build (linear, 1.6 viewports per clip), peak camera motion per unit of scroll
+  drops ~41–47 % on c1–c3 and ~73 % on c4. The clips' lengths grow with how much
+  each moves (not in proportion; c4 would need ~20 viewports). Re-run the script
+  whenever a clip changes. `smoothing` 0.1 is the share of the gap to the scroll
+  position the video closes per 1/60 s (≈160 ms time constant at any refresh
+  rate): more weight, less mouse-wheel jitter.
 - **Engine behaviour (from the skill):** clips are fetched as Blobs (always
   seekable, no dependence on HTTP range support), loaded when within 1.6
-  viewports of their segment, and scrubbed with rAF smoothing (lerp 0.18).
+  viewports of their segment, and scrubbed with rAF smoothing (`smoothing`).
   Layers swap with a cut at the frame-matched seams; `crossfade` (0.08
   viewport-heights) is how far before a seam the next layer is already kept in
   sync underneath, not a visible dissolve. On phones it serves the `-m` files,
@@ -104,12 +119,18 @@ src/pages/index.astro, src/pages/en/index.astro
     fetch the clips around the top first).
 14. Stills load in the clips' load window (`loading=lazy` never deferred them in
     a fixed stage); the first visible still is prioritised and gates the clips.
+15. Connector pacing: `connScroll` per clip (array; capped at 1 viewport under
+    reduced motion), `connectorTimeMaps` (per-clip scroll → time tables, linear
+    if absent or malformed) and `smoothing` (the rAF lerp, per 1/60 s).
+16. The scrub lerp advances every frame, not only between seeks (it used to
+    stall while the decoder was seeking, so the video lagged the scroll on slow
+    decoders), and is normalised to 60 fps.
 
 ## 4. Degradation
 
 | Condition | Behaviour |
 | --- | --- |
-| `prefers-reduced-motion` | No clip is downloaded; each stop's still holds and switches to the next one with a cut at the start of each clip's band. |
+| `prefers-reduced-motion` | No clip is downloaded; each stop's still holds and switches to the next one with a cut at the start of each clip's band (bands capped at 1 viewport). |
 | JavaScript disabled, the module fails to load, or the engine fails to mount | `html.js` is absent or removed (inline check at `DOMContentLoaded`, plus the mount `catch`): a stacked static version of the five stops, with the h1 and a language link, is shown instead. |
 | A clip fails to load | Its still stays up; the rest of the flight keeps working. |
 

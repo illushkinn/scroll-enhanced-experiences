@@ -90,6 +90,13 @@
     14. Stills load lazily in the clip load window (lazy-loading never deferred
         them in a fixed stage); the first visible still gets high priority and
         clips wait for it (or for window load).
+    15. Connector pacing: `connScroll` may be an array (one length per clip; capped
+        at 1 viewport under reduced motion, where a band only holds a still),
+        `connectorTimeMaps` gives each clip a scroll→time table (built from its
+        measured motion, with zero speed at both seams), and `smoothing` is the
+        rAF lerp per 1/60 s (default 0.18).
+    16. The scrub lerp advances every frame (it stalled while a seek was in
+        flight) and is frame-rate independent.
    ========================================================================== */
 
 // PATCH 1: ES module export (was a global + CommonJS shim at the bottom).
@@ -105,7 +112,21 @@ export function mountScrollWorld(container, config) {
   const CONNECTORS = config.connectors || [];
   const CONNECTORS_M = config.connectorsMobile || [];
   const DIVE_W = config.diveScroll || 1.3;
-  const CONN_W = config.connScroll || 0.9;
+  // PATCH 15: a number for every connector, or one length per connector. Under
+  // reduced motion a connector band only holds the next still, so keep it short.
+  const connW = i => {
+    const w = (Array.isArray(config.connScroll) ? config.connScroll[i] : config.connScroll) || 0.9;
+    return reduce ? Math.min(w, 1) : w;
+  };
+  // PATCH 15: optional per-connector scroll→time table (samples of a monotone map
+  // from 0 to 1). Anything malformed falls back to the linear mapping.
+  const timeMap = i => {
+    const t = Array.isArray(config.connectorTimeMaps) ? config.connectorTimeMaps[i] : null;
+    const ok = Array.isArray(t) && t.length >= 2 && t[0] === 0 && t[t.length - 1] === 1 &&
+      t.every((v, k) => typeof v === 'number' && (k === 0 || v >= t[k - 1]));
+    return ok ? t : null;
+  };
+  const SMOOTHING = (config.smoothing > 0 && config.smoothing <= 1) ? config.smoothing : 0.18;   // PATCH 15
   const CROSSFADE = (config.crossfade != null) ? config.crossfade : 0.12;  // seam dissolve width (vh)
   const STILL_MOTION = config.stillMotion !== false;                       // PATCH 2
   const DEFAULT_FOCUS = [50, 42];                                          // PATCH 4
@@ -129,7 +150,7 @@ export function mountScrollWorld(container, config) {
     if (i < N - 1 && CONNECTORS[i]) {
       SEGMENTS.push({ kind: 'conn', si: i, clip: CONNECTORS[i], clipM: CONNECTORS_M[i],
                       still: SECTIONS[i + 1].still, stillM: SECTIONS[i + 1].stillMobile,
-                      accent: SECTIONS[i + 1].accent, w: CONN_W,
+                      accent: SECTIONS[i + 1].accent, w: connW(i), timeMap: timeMap(i),   // PATCH 15
                       // PATCH 4: the connector's crop travels from the origin stop's focus
                       // to the destination's, matching both seams.
                       focusA: s.focus || DEFAULT_FOCUS, focusB: SECTIONS[i + 1].focus || DEFAULT_FOCUS });
@@ -229,6 +250,12 @@ export function mountScrollWorld(container, config) {
   // (where the copy peaks) and moves quicker near the seams. L=0 linear, L=1 full
   // mid-scene pause. f(0)=0, f(1)=1 always, so seam frames are untouched.
   const lingerEase = (x, L) => { L = clamp(L); const c = x - 0.5; return (1 - L) * x + L * (4 * c * c * c + 0.5); };
+  // PATCH 15: piecewise-linear lookup in a connector's time map.
+  const mapTime = (table, x) => {
+    const p = clamp(x) * (table.length - 1);
+    const k = Math.min(Math.floor(p), table.length - 2);
+    return table[k] + (table[k + 1] - table[k]) * (p - k);
+  };
   let vh = window.innerHeight, stageX = 0, totalW = 0, activeIndex = -1, ticking = false;
   let laidOutW = window.innerWidth;   // width the current layout was computed at (see onResize)
   // PATCH 14: clips wait until the still on screen at mount has loaded (or the page
@@ -319,7 +346,9 @@ export function mountScrollWorld(container, config) {
         if (postersReady) loadClip(s);
       }
       const local = clamp((y - s.start) / (s.end - s.start), 0, 1);
-      s.target = s.linger ? lingerEase(local, s.linger) : local;
+      // PATCH 15: a connector's time map spreads its motion evenly over the band and
+      // starts/lands at rest. f(0)=0 and f(1)=1, so the seam frames are untouched.
+      s.target = s.linger ? lingerEase(local, s.linger) : s.timeMap ? mapTime(s.timeMap, local) : local;
       let outside = 0;
       if (y < s.start) outside = s.start - y; else if (y > s.end) outside = y - s.end;
       const op = smooth(1 - outside / fade);
@@ -375,23 +404,31 @@ export function mountScrollWorld(container, config) {
     ticking = false;
   }
 
-  function raf() {
+  let lastFrame = 0;
+  function raf(now) {
+    // PATCH 16: smoothing is per 1/60 s, so 120 Hz screens feel the same as 60 Hz.
+    const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 1 / 60;
+    lastFrame = now;
+    const k = reduce ? 1 : 1 - Math.pow(1 - SMOOTHING, dt * 60);
     const eps = isMobile() ? 0.02 : 0.008;   // coarser seek step on phones = fewer decodes
     for (let i = 0; i < NSEG; i++) {
       const s = SEGMENTS[i];
       if (!s.hasClip || !s.ready || !s.video) continue;
+      if (!s.visible && Math.abs(s.cur - s.target) < 0.002) continue;
+      // PATCH 16: cur advances every frame. It used to stop while a seek was in
+      // flight, so the video lagged the scroll by as many lerp steps as there were
+      // slow seeks (worst on phones, and with heavier smoothing).
+      s.cur += (s.target - s.cur) * k;
       // Never queue a seek while the decoder is still resolving the last one.
       // On phones a fast flick would otherwise pile up seeks and freeze the clip;
-      // cur keeps lerping, so we snap to the latest target the moment it's free.
+      // the next free frame seeks straight to the latest cur.
       if (s.video.seeking) continue;
-      if (!s.visible && Math.abs(s.cur - s.target) < 0.002) continue;
-      s.cur += (s.target - s.cur) * (reduce ? 1 : 0.18);
       const dur = s.video.duration || 1;
       const t = clamp(s.cur, 0, 0.999) * dur;
       if (Math.abs(s.video.currentTime - t) > eps) { try { s.video.currentTime = t; } catch (e) {} }
-      // PATCH 4: follow the frame actually being shown, so the crop lands on the
+      // PATCH 4: follow the frame actually requested, so the crop lands on the
       // origin focus at the first frame and on the destination focus at the last.
-      if (s.kind === 'conn') s.video.style.objectPosition = focusAt(s, s.cur);
+      if (s.kind === 'conn') s.video.style.objectPosition = focusAt(s, t / dur);
     }
     requestAnimationFrame(raf);
   }
