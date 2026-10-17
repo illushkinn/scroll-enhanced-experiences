@@ -23,14 +23,14 @@ video), replaced by the table below.
 The four source clips are 1912×1080, 24 fps, 4.04 s (97 frames), silent, with
 no colour tags. Seams were measured before wiring: PSNR between the last frame
 of clip k and the first frame of clip k+1 is 35.4–36.7 dB on the raw sources
-and 32.5–33.8 dB on the encodes. The skill judges seams by composition rather than raw PSNR (Step 8: a
+and 32.5–33.8 dB on the desktop encodes (31.8–32.9 dB on the phone ones; PSNR over RGB). The skill judges seams by composition rather than raw PSNR (Step 8: a
 correctly frame-locked seam can read ~18–25 dB); all three match in composition.
 
 | Output | Command (per clip) | Notes |
 | --- | --- | --- |
 | `clips/cN.mp4` | `ffmpeg -i src.mp4 -an -vf "unsharp=5:5:0.8:5:5:0.0" -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p -bf 0 -g 8 -keyint_min 8 -sc_threshold 0 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv -movflags +faststart cN.mp4` | Desktop. Native resolution, a keyframe every 8 frames (≈0.33 s), no B-frames (a seek never decodes frames out of order; ~3 % larger), tagged BT.709 so a browser doesn't have to guess the colour matrix (Chrome and Firefox already assumed BT.709 for untagged HD; Safari's handling of the tags is worth a look on a real device). |
 | `clips/cN-m.mp4` | same, with `-vf "scale=-2:720,unsharp=5:5:0.6:5:5:0.0" -crf 23 -g 4 -keyint_min 4` | Phones. 720p, tighter GOP = cheaper seeks on a phone decoder. |
-| `stops/sK.webp` | `ffmpeg -i clips/c(K+1).mp4 -frames:v 1 -vf "scale=in_color_matrix=bt709:in_range=tv:flags=accurate_rnd+full_chroma_int,format=bgra" -c:v libwebp -quality 84 sK.webp` | Stop K = **first frame of clip K+1** (K = 0–3). The frame goes through RGB on purpose: passed straight through, the video's BT.709 YUV was stored in the WebP, which browsers decode as BT.601, so next to a BT.709 video the stills came out cooler and darker (R −1.7 to −4.4, G −1 to −2.5, B up to +2 levels). Now within ±0.3 levels; PSNR to the frame the browser shows went from 35.3–37.8 to 39.0–40.9 dB (phones: 34.6–36.3 to 37.2–39.1 dB). |
+| `stops/sK.webp` | `ffmpeg -i clips/c(K+1).mp4 -frames:v 1 -vf "scale=in_color_matrix=bt709:in_range=tv:flags=accurate_rnd+full_chroma_int,format=bgra" -c:v libwebp -quality 84 sK.webp` | Stop K = **first frame of clip K+1** (K = 0–3). The frame goes through RGB on purpose: passed straight through, the video's BT.709 YUV was stored in the WebP, which browsers decode as BT.601, so next to a BT.709 video the stills came out cooler and darker (R −1.6 to −4.4, G −1 to −2.5, B up to +2 levels). Now within ±0.4 levels; PSNR to the video frame went from 35.3–37.8 to 39.0–40.9 dB (phones: 34.5–36.3 to 37.1–39.1 dB). These figures model the browser with an exact BT.709 decode in ffmpeg; a GPU-less Chromium draws video slightly bluer than that, so check one seam on a real device. |
 | `stops/s4.webp` | `ffmpeg -i clips/c4.mp4 -vf "select=eq(n\,96),scale=in_color_matrix=bt709:in_range=tv:flags=accurate_rnd+full_chroma_int,format=bgra" -frames:v 1 -c:v libwebp -quality 84 s4.webp` | Last stop = **last frame of clip 4**. |
 | `stops/sK-m.webp` | same, from the `-m.mp4` encodes, `-quality 80` | Phone posters, matching the phone clips. |
 | `og.jpg` | `ffmpeg -i stops/s3.webp -vf "scale=1200:-2,crop=1200:630:0:(ih-630)*0.45" -q:v 3 og.jpg` | Social preview: the tower stop scaled to 1200 wide (1200×678), cropped to 630 high at y≈22. |
@@ -69,10 +69,10 @@ src/pages/index.astro, src/pages/en/index.astro
   band (75 % measured motion, 25 % plain time) and ramps the speed up and down
   over the first and last 12 %, so the camera leaves each stop from rest and
   settles into the next. The frames are lightly blurred before measuring, so
-  compression noise (which jumps at every keyframe) doesn't count as motion:
+  compression noise (which jumps at every keyframe) counts much less as motion:
   the tables land within 0.4 % of the clip of the same measurement on the raw
   clips. That blur also counts fine texture as less motion than before, so the
-  pacing moved by up to 5.8 % of a clip (≈5 frames, c2) versus the first
+  pacing moved by up to 5.8 % of a clip (5–6 frames, c2) versus the first
   tables. The clips' lengths grow with how much each moves
   (not in proportion; c4 would need ~20 viewports). Re-run it whenever a clip
   changes.
@@ -86,10 +86,11 @@ src/pages/index.astro, src/pages/en/index.astro
   stays one continuous flight). Before, layers and
   copy followed the raw scroll while the video chased it with a lerp, so every
   seam cut to the next still before the video had arrived. Scrolling stop to
-  stop, the QA measured 7–8 frames skipped per seam at 1 viewport/s, 15–19 at 2
-  and 29–38 at 4 on the live build (2–6, 7–18 and 16–36 after the first pacing
-  fix); now 0 at all three speeds (the check allows 1). Headless runs vary by a
-  few frames from run to run. A spring also eases into each wheel notch instead of starting
+  stop, the QA measured 7–12 frames skipped per seam at 1 viewport/s, 15–30
+  at 2 and 29–74 at 4 on the live build over four runs (2–6, 7–18 and 16–36
+  after the first pacing fix): the old lag depended on frame timing, so it
+  varied a lot. Now 0 at all three speeds in every run (the check allows 1, and
+  also requires each clip to show at least 20 different frames on the way). A spring also eases into each wheel notch instead of starting
   at full speed like a lerp.
 - **Frames, not seconds:** the video seeks only when the frame index changes,
   to the middle of that frame (`fps` 24), so at rest the picture is exactly
@@ -101,16 +102,22 @@ src/pages/index.astro, src/pages/en/index.astro
   in (0.32 s). Nothing scrubs through the clips in between and only the
   destination's media is fetched (a menu jump to the penthouse used to download
   c2, c3 and c4; a download still running for the old position is dropped).
-  Clicking the stop you are on does nothing.
+  Clicking the stop you are on does nothing (or, off-centre, glides to it).
+  While the veil fades out the picture holds still, even when the browser has
+  already scrolled (End key).
 - **Soft snap (`snap`):** after 400 ms at rest within half a viewport of a stop
   whose copy isn't fully shown, the page glides on to that stop (0.6–1.2 s) —
   only in the direction the visitor was scrolling, so it finishes a move and
-  never pulls anyone back. Off under reduced motion, while a finger is down and
-  while the menu is open.
+  never pulls anyone back. That direction is learned only from the visitor's
+  own scrolling since the page loaded: a restored position after a reload, a
+  click or a Tab never starts a glide. Off under reduced motion, while a finger
+  or mouse button is down and while the menu is open.
 - **Engine behaviour (from the skill, plus patches):** clips are fetched as
   Blobs (always seekable, no dependence on HTTP range support), one at a time,
   nearest first, when within 1.6 viewports of `vy`; a download is dropped
-  when the visitor moves away, times out after 30 s, and a failed one retries
+  when the visitor moves away or when nothing arrives for 30 s (a slow but
+  steady download is never cut: on a 1.6 Mbps line c1 arrives after 38 s), and
+  a failed one retries
   after 2, 4 and 8 s and then gives up (the stills carry on). Layers swap with
   a cut at the frame-matched seams; `crossfade` (0.08 viewport-heights) is how
   far before a seam the next layer is already kept in sync underneath, not a
@@ -179,11 +186,12 @@ src/pages/index.astro, src/pages/en/index.astro
     `api.jumpTo(id, { instant })`. A gap wider than `teleportGap` opened faster
     than `teleportSpeed` fades too.
 20. Directional soft snap (`snap: { idle, range }` or `false`) to the nearest
-    stop ahead; `api.setSnap(false)` pauses it; nothing snaps before the
-    visitor's first input (a restored position on reload is not a direction).
+    stop ahead; `api.setSnap(false)` pauses it; the direction comes only from
+    the visitor's own scrolling since load (not a restored position, a click
+    or a Tab); a native drag (pointercancel/dragend) releases the mouse state.
 21. Copy plateau (see Copy above).
 22. Sequential clip loading in the scroll direction, abort on moving away,
-    30 s timeout, retry backoff 2/4/8 s, origin → destination dissolve while a
+    30 s stall timeout, retry backoff 2/4/8 s, origin → destination dissolve while a
     clip isn't painted, clips fade in over it once painted.
 23. Resize/rotation keeps the segment and progress; `orientationchange`
     forces the next resize through.
@@ -205,17 +213,21 @@ pnpm build && pnpm check && pnpm qa
 `scripts/qa.mjs` serves `dist/`, drives the page in Chrome (or Playwright's
 Chromium) and prints pass/fail for: frames skipped at each clip→stop cut when
 scrolling stop to stop at 1, 2 and 4 viewports/s; presented frame = target
-frame at rest; load order and retry backoff; the dissolve when a clip never
-arrives; menu jump (fade, lands on the stop, fetches only the destination clip);
-End key; snap (finishes a move, never pulls back, paused behind the menu);
+frame at rest; one download at a time, the clip ahead first, retry backoff
+and giving up; the dissolve when a clip never arrives; menu jump (fade, lands on
+the stop, fetches only the destination clip); End key (nothing moves before the
+fade covers it); snap (finishes a move, never pulls back, paused behind the
+menu and back after it);
 reduced motion (no clip requests, dissolve, no snap); menu keyboard and focus;
 deep links; resize; copy on screen and phone clips at 1440×900, 390×844 and
-844×390; the no-JS story. The `robust` group replays what an adversarial
-review reproduced against the first version of these patches (all six failed
-there): a fast continuous scroll never fades, a late clip never shows the
-background, scrolling up into a missing clip keeps its origin still, a slow
-download doesn't hold up a jump, a reload doesn't snap by itself, and clicking
-the current stop doesn't blink. `--dist` points it at another build (e.g. master) to
+844×390; the no-JS story. The `robust` group replays what adversarial
+reviews reproduced against earlier versions of these patches (each check
+failed there): a fast continuous scroll never fades, a late clip never shows
+the background, scrolling up into a missing clip keeps its origin still, a
+slow download doesn't hold up a jump, a reload — even followed by a click or a
+Tab — doesn't glide by itself, the snap survives a native drag, and clicking
+the current stop doesn't blink. Not in the suite (it takes a minute): a clip
+trickled at 1.6 Mbps arrives after 38 s instead of being cut at 30 s. `--dist` points it at another build (e.g. master) to
 compare, `--only` runs some groups, `--json` saves the raw numbers.
 
 Headless Chromium builds lack an H.264 decoder, so the script then serves VP9
@@ -247,8 +259,9 @@ why the picture is still a video rather than an image sequence:
   car, not the scrollbar; the lesson used here is only that perceived weight
   comes from a damped model with a speed limit, not from a linear mapping.
 - **Image sequences (Apple-style canvas).** Measured on these clips: a WebP
-  sequence at 1280 px, quality 72, weighs 41.5 MB for the 388 frames — 1.3–2.2×
-  the MP4s — and every decoded frame costs width × height × 4 bytes of memory.
+  sequence at 1280 px, quality 72, weighs 41.5 MB for the 388 frames — 1.24×
+  the desktop MP4s and 2.4× the phone ones — and every decoded frame costs
+  width × height × 4 bytes of memory.
   Not adopted. If an iPhone still stutters after these patches, the next
   experiment is a canvas fed by WebCodecs (`VideoDecoder`, Safari 16.4+).
 

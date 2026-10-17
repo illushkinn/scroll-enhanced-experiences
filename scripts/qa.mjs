@@ -34,6 +34,8 @@ import { chromium } from 'playwright-core';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
 const arg = (name) => {
+  const eq = argv.find((a) => a.startsWith(`--${name}=`));
+  if (eq) return eq.slice(name.length + 3);
   const i = argv.indexOf(`--${name}`);
   return i >= 0 ? argv[i + 1] : undefined;
 };
@@ -55,13 +57,18 @@ if (unknown.length) {
 }
 const want = (group) => !ONLY || ONLY.includes(group);
 // A group that throws (a timeout, a missing element) records a failure and the
-// run carries on with the next group.
+// run carries on with the next group; whatever it left open is closed first, so
+// a stray page doesn't load the CPU during later timing checks.
+const live = new Set();
 async function group(name, fn) {
   if (!want(name)) return;
   try {
     await fn();
   } catch (error) {
     check(name, 'group ran to the end', false, String(error.message).split('\n')[0]);
+  } finally {
+    for (const ctx of live) await ctx.close().catch(() => {});
+    live.clear();
   }
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -117,8 +124,9 @@ async function vp9Proxies(clipsDir) {
     const out = path.join(cache, `${name}-${key}.webm`);
     if (!existsSync(out)) {
       // Written aside and renamed, so an interrupted encode is never reused.
-      execFileSync('ffmpeg', ['-v', 'error', '-y', '-i', src, ...args, `${out}.tmp`]);
-      await rename(`${out}.tmp`, out);
+      const tmp = `${out}.${process.pid}.tmp`;
+      execFileSync('ffmpeg', ['-v', 'error', '-y', '-i', src, ...args, tmp]);
+      await rename(tmp, out);
     }
     map[name] = out;
   }
@@ -174,7 +182,7 @@ function instrument() {
         }
         frames.push(v && v.__frame != null ? v.__frame : null);
       });
-      if (qa.recording) qa.ticks.push({ t: now, y: window.scrollY, top, frames });
+      if (qa.recording) qa.ticks.push({ t: now, y: window.scrollY, top, frames, veil: window.veil() });
     }
     requestAnimationFrame(loop);
   };
@@ -280,6 +288,8 @@ console.log(`browser ${browser.version()} · H.264 ${h264 ? 'native' : 'missing 
 async function context(opts = {}) {
   const { fail, delay = {}, ...rest } = opts;
   const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, ...rest });
+  live.add(ctx);
+  ctx.on('close', () => live.delete(ctx));
   await ctx.addInitScript(instrument);
   await ctx.route('**/media/**', async (route) => {
     const file = path.basename(new URL(route.request().url()).pathname);
@@ -303,7 +313,7 @@ try {
     await preloadAll(page, geo);
     raw.seams = {};
     for (const speed of [1, 2, 4]) {
-      const skips = [], jumps = [];
+      const skips = [], jumps = [], distinct = [];
       for (let k = 0; k < geo.ids.length - 1; k++) {
         const from = geo.centers[k], to = geo.centers[k + 1];
         await page.evaluate((y) => window.scrollTo(0, y), from);
@@ -326,13 +336,16 @@ try {
           if (a != null && b != null) maxJump = Math.max(maxJump, b - a);
         }
         jumps.push(maxJump);
+        // How many different frames the clip showed while on top.
+        distinct.push(new Set(ticks.filter((t) => t.top === conn && t.frames[conn] != null).map((t) => t.frames[conn])).size);
       }
-      raw.seams[speed] = { skips, jumps };
+      raw.seams[speed] = { skips, jumps, distinct };
       const worst = Math.max(...skips.map((s) => (s == null ? 99 : s)));
-      // A frozen clip would also "skip nothing" if it happened to rest on its last frame.
-      const played = jumps.every((j) => j > 0);
+      // The clip must really play on the way: a frozen clip, or one that holds and
+      // then leaps to its end, would also "skip nothing" at the cut.
+      const played = distinct.every((d) => d >= 20) && jumps.every((j) => j <= 24);
       check('seams', `frames skipped at clip→stop cuts, ${speed} viewports/s`, worst <= 1 && played,
-        `per clip [${skips.join(', ')}]; largest advance per screen frame [${jumps.join(', ')}]`);
+        `per clip [${skips.join(', ')}]; frames shown [${distinct.join(', ')}]; largest advance per screen frame [${jumps.join(', ')}]`);
     }
     check('seams', 'no page errors', errors.length === 0, errors.slice(0, 3).join(' | '));
     await ctx.close();
@@ -368,7 +381,8 @@ try {
   // -- loading: one download at a time; failures back off ----------------------------
   await group('loading', async () => {
     // From a fresh page at "plano", both neighbouring clips load — one at a time
-    // (c1 is slowed so two parallel downloads would visibly overlap).
+    // (both are slowed, so two parallel downloads would visibly overlap), the one
+    // ahead first (they are equally near; the first direction is down).
     const ctx = await context({ delay: { 'c1.mp4': 1500, 'c2.mp4': 1500 } });
     const reqs = new Map();
     ctx.on('request', (r) => { if (/\/media\/clips\//.test(r.url())) reqs.set(r, { name: path.basename(r.url()), start: Date.now(), end: Infinity }); });
@@ -380,23 +394,27 @@ try {
     const list = [...reqs.values()];
     const names = list.map((q) => q.name);
     check('loading', 'from a stop, the clips on both sides load', names.includes('c1.mp4') && names.includes('c2.mp4'), names.join(', '));
+    check('loading', 'the clip ahead loads before the one behind', names.indexOf('c2.mp4') !== -1 && names.indexOf('c2.mp4') < names.indexOf('c1.mp4'), names.join(' → '));
     const overlap = list.some((a, i) => list.some((b, j) => i < j && a.start < b.end && b.start < a.end));
     check('loading', 'one clip download at a time', list.length >= 2 && !overlap,
       list.map((q) => `${q.name} ${q.start - list[0].start}–${q.end === Infinity ? '…' : q.end - list[0].start} ms`).join(', '));
     await ctx.close();
 
-    // A failing clip: tries at about 0, +2 and +6 s and no more, even while the
-    // visitor keeps scrolling near it.
+    // A failing clip backs off instead of retrying every frame, even while the
+    // visitor keeps scrolling near it: tries at about 0, +2, +6 and +14 s (retries
+    // after 2, 4 and 8 s), then gives up.
     const ctx2 = await context({ fail: ['c1'] });
     let failed = 0;
     ctx2.on('request', (r) => { if (/\/clips\/c1\.mp4$/.test(r.url())) failed++; });
     const p2 = await openPage(ctx2, base);
     const g2 = await geometry(p2.page);
-    for (let i = 0; i < 16; i++) {
+    const counts = [];
+    for (let i = 0; i < 40; i++) {
       await p2.page.evaluate((y) => window.scrollTo(0, y), Math.round((i % 2 ? 0.2 : 0.4) * g2.vh));
       await sleep(470);
+      if (i === 15 || i === 39) counts.push(failed);
     }
-    check('loading', 'a failing clip is retried with backoff (3 tries in 7.5 s)', failed === 3, `${failed} requests`);
+    check('loading', 'a failing clip backs off (3 tries in 7.5 s) and gives up (4 in 19 s)', counts[0] === 3 && counts[1] === 4, `${counts[0]} requests after 7.5 s, ${counts[1]} after 19 s`);
     const mid = g2.segs[1];
     await p2.page.evaluate((y) => window.scrollTo(0, y), Math.round((mid.start + mid.end) / 2));
     await settle(p2.page);
@@ -436,12 +454,18 @@ try {
     await page.evaluate(() => window.scrollTo(0, 0));
     await sleep(1500);
     veilMax = 0;
+    await page.evaluate(() => { window.__qa.ticks = []; window.__qa.recording = true; });
     await page.keyboard.press('End');
     for (let i = 0; i < 30; i++) {
       veilMax = Math.max(veilMax, await page.evaluate(() => veil()));
       await sleep(25);
     }
     await sleep(2000);
+    const endTicks = await page.evaluate(() => { window.__qa.recording = false; return window.__qa.ticks; });
+    const covered = endTicks.findIndex((t) => t.veil >= 0.95);
+    const moved = covered > 0 && endTicks.slice(0, covered).some((t) => t.top !== endTicks[0].top);
+    check('jump', 'End key: nothing moves on screen until the fade has covered it', covered > 0 && !moved,
+      covered > 0 ? `scenes shown before cover: ${[...new Set(endTicks.slice(0, covered).map((t) => t.top))].join(', ')}` : 'veil never covered');
     const lastCopy = await page.evaluate(() => +getComputedStyle([...document.querySelectorAll('.sw-copy')].at(-1)).opacity);
     check('jump', 'End key fades to the end instead of flying through', veilMax > 0.9 && lastCopy > 0.99, `veil peak ${veilMax.toFixed(2)}, last copy ${lastCopy}`);
     check('jump', 'no page errors', errors.length === 0, errors.slice(0, 3).join(' | '));
@@ -566,6 +590,41 @@ try {
       check('robust', 'a reload does not snap by itself', Math.abs(after - y) <= 2, `left at ${y}, after reload ${after}`);
       await ctx.close();
     }
+    // After a reload, a click or a Tab is not a direction: no glide either.
+    for (const how of ['Tab', 'click']) {
+      const ctx = await context();
+      const { page } = await openPage(ctx, base);
+      const geo = await geometry(page);
+      const y = Math.round(geo.segs[2].start - 0.3 * geo.vh);
+      await page.mouse.wheel(0, 1);
+      await page.evaluate(([a, b, v]) => window.__qa.drive(a, b, v), [Math.round(geo.centers[1]), y, geo.vh]);
+      await settle(page);
+      await page.reload({ waitUntil: 'load' });
+      await sleep(500);
+      if (how === 'Tab') await page.keyboard.press('Tab'); else await page.mouse.click(700, 450);
+      await sleep(2000);
+      const after = await page.evaluate(() => window.scrollY);
+      check('robust', `after a reload, a ${how} does not make the page glide`, Math.abs(after - y) <= 2, `left at ${y}, after ${after}`);
+      await ctx.close();
+    }
+    // A native drag ends in pointercancel/dragend, not pointerup: the snap must still work.
+    for (const end of ['pointercancel', 'dragend']) {
+      const ctx = await context();
+      const { page } = await openPage(ctx, base);
+      const geo = await geometry(page);
+      await page.evaluate((type) => {
+        window.dispatchEvent(new PointerEvent('pointerdown', { pointerType: 'mouse' }));
+        window.dispatchEvent(type === 'dragend' ? new DragEvent('dragend') : new PointerEvent(type, { pointerType: 'mouse' }));
+      }, end);
+      await page.mouse.wheel(0, 1);
+      const c1 = geo.segs[1];
+      await page.evaluate(([a, b, v]) => window.__qa.drive(a, b, v), [c1.start, Math.round(c1.end - 0.3 * geo.vh), geo.vh]);
+      await sleep(1500);
+      await settle(page);
+      const y = await page.evaluate(() => window.scrollY);
+      check('robust', `the snap still works after a drag that ends in ${end}`, Math.abs(y - geo.centers[1]) <= 2, `scrollY ${y}, stop ${Math.round(geo.centers[1])}`);
+      await ctx.close();
+    }
     // Clicking the stop you are on does nothing.
     {
       const ctx = await context();
@@ -576,6 +635,18 @@ try {
       await sleep(800);
       const c = await cov(page);
       check('robust', 'jumping to the current stop does not blink', c.veil < 0.05, `veil peak ${c.veil.toFixed(2)}`);
+      // Off-centre but still reading it: a short glide, not a fade.
+      const geo = await geometry(page);
+      const off = Math.round(geo.centers[2] - 0.2 * geo.vh);
+      await page.mouse.wheel(0, 1);
+      await page.evaluate((v) => window.scrollTo(0, v), off);
+      await settle(page);
+      await resetCov(page);
+      await page.evaluate(() => document.querySelectorAll('.sw-route__dot')[2].click());
+      await sleep(1200);
+      const c2 = await cov(page);
+      const y = await page.evaluate(() => window.scrollY);
+      check('robust', 'clicking the current stop off-centre glides to it without a fade', c2.veil < 0.05 && Math.abs(y - geo.centers[2]) <= 2, `veil peak ${c2.veil.toFixed(2)}, scrollY ${y}, stop ${Math.round(geo.centers[2])}`);
       await ctx.close();
     }
   });

@@ -35,6 +35,9 @@
        snap: { idle: 400, range: 0.5 },   // or false (PATCH 20)
        fps: 24,                           // clip frame rate (PATCH 18)
        initialSection: 'id', onActive(index) {}, // PATCH 13, 6
+       stillMotion: false,                // PATCH 2; sections also take focus: [x, y] (4)
+                                          // and titleTag: 'h1' (5)
+       crossfade: 0.12,                   // viewports a layer is kept under the next at a seam
 
    MOBILE (the clipMobile/connectorsMobile variants are the opt-in mobile version;
    the rest of the phone handling below is always on)
@@ -107,7 +110,7 @@
     16. (Superseded by 17: the per-video lerp is gone.)
     17. One smoothed scroll position drives everything. `vy` follows the
         browser's scroll through a critically damped spring with a speed cap
-        that loosens once it lags more than 2 viewports (`damping: {
+        that loosens with the square of the lag past 2 viewports (`damping: {
         smoothTime, touchSmoothTime, maxSpeed }`), and
         layers, copy, route, progress bar and video frames are all rendered from
         it in a single rAF loop. Before, layers and copy followed the raw scroll
@@ -123,16 +126,19 @@
         (which also downloaded all of them).
     20. Directional soft snap (`snap: { idle, range }` or `false`): after a
         pause, a resting point near a stop finishes the move toward that stop,
-        never against the last scroll direction. Off under reduced motion,
-        while touching and while `api.setSnap(false)` (e.g. a menu is open).
+        never against the last scroll direction (learned only from the
+        visitor's own scrolling since the page loaded). Off under reduced
+        motion, while touching or dragging and while `api.setSnap(false)`
+        (e.g. a menu is open).
     21. Copy holds a plateau: middle stops are fully visible over the central
         60 % of their band, the hero over its first 30 %.
     22. Clips load one at a time, nearest first and ahead in the scroll
         direction, retrying with backoff (2/4/8 s) instead of every frame; a
-        download is aborted when the visitor moves away and times out after
-        30 s. A connector whose clip hasn't painted dissolves origin →
-        destination still (also the reduced-motion behaviour), and a clip fades
-        in once painted, over that dissolve.
+        download is aborted when the visitor moves away or when nothing arrives
+        for 30 s (a slow but steady one is never cut). A connector whose clip
+        hasn't painted dissolves origin → destination still (also the
+        reduced-motion behaviour), and a clip fades in once painted, over that
+        dissolve.
     23. Resizing or rotating keeps the visitor at the same point of the story.
    ========================================================================== */
 
@@ -173,8 +179,9 @@ export function mountScrollWorld(container, config) {
   // A jump is a discontinuity: the gap must be wide AND the scroll must be moving
   // faster than any hand does (End key, scrollbar click or fast drag, anchors).
   const TELEPORT_SPEED = posNum(DAMP.teleportSpeed, 15);
-  // Past this lag (viewports) the speed cap loosens in proportion, so a fast but
-  // continuous scroll stays a continuous flight instead of falling ever further behind.
+  // Past this lag (viewports) the speed cap loosens with the square of the lag, so a
+  // fast but continuous scroll stays one flight and the lag stays bounded (≈4 vh at
+  // 12 vh/s) instead of growing until the visitor stops.
   const CATCH_UP = 2;
   const FPS = posNum(config.fps, 24);                                       // PATCH 18
   const SNAP = (config.snap === false || reduce) ? null : {                 // PATCH 20
@@ -325,14 +332,16 @@ export function mountScrollWorld(container, config) {
   // Until the page has loaded (or the visitor touches anything) vy just mirrors
   // rawY, so a restored scroll position or a deep link doesn't fly in from the top.
   let rawY = window.scrollY || window.pageYOffset || 0, lastRawY = rawY, scrollDir = 1;
+  // PATCH 20: the snap needs a direction learned from the visitor's own scrolling.
+  let dirKnown = false;
   let vy = rawY, vel = 0, renderedY = NaN, dirty = true, booting = true;
-  // PATCH 19: jump state ({ phase: 'out' | 'hold' | 'in', t0, from, top }).
+  // PATCH 19: jump state ({ phase: 'out' | 'hold' | 'in', t0, from, si }).
   let jump = null, veilOpacity = 0;
   // PATCH 20: snap state.
   let snapAnim = null, snapEnabled = true, snapCheckedAt = NaN;
   let lastInputAt = 0, lastScrollAt = 0, touching = false, mouseDown = false;
   let rawSpeed = 0;   // PATCH 19: smoothed speed of the browser's scroll (px/s)
-  // PATCH 22: the one clip being downloaded ({ s, ctrl, timer }).
+  // PATCH 22: the one clip being downloaded ({ s, ctrl, timer, aborted }).
   let inflight = null;
   let rafId = 0, stopped = false;
 
@@ -391,7 +400,12 @@ export function mountScrollWorld(container, config) {
   const JUMP_OUT = 200, JUMP_IN = 320, JUMP_HOLD_MAX = 1200;
   function startJump(si) {
     cancelSnap();
-    if (si != null && !jump && Math.abs(jumpTarget(si) - rawY) < 2 && Math.abs(vy - rawY) < 2) return;   // already there
+    // Already reading that stop: no fade. Off-centre within its plateau, glide to it.
+    if (si != null && !jump && Math.abs(vy - rawY) < 2 && copyOpacity(si, rawY) > 0.98) {
+      const to = Math.round(jumpTarget(si));
+      if (!reduce && Math.abs(to - rawY) > 2) snapAnim = { from: rawY, to, t0: performance.now(), dur: 600, last: rawY };
+      return;
+    }
     if (reduce) {
       if (si != null) window.scrollTo(0, Math.round(jumpTarget(si)));
       rawY = lastRawY = window.scrollY || 0; vy = rawY; vel = 0; dirty = true;
@@ -438,7 +452,7 @@ export function mountScrollWorld(container, config) {
     const omega = 2 / SMOOTH_TIME, x = omega * dt;
     const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
     const lag = Math.abs(target - cur) / (CATCH_UP * vh);
-    const maxChange = MAX_SPEED * Math.max(1, lag) * vh * SMOOTH_TIME;
+    const maxChange = MAX_SPEED * Math.max(1, lag * lag) * vh * SMOOTH_TIME;
     const change = clamp(cur - target, -maxChange, maxChange);
     const temp = (vel + omega * change) * dt;
     vel = (vel - omega * temp) * exp;
@@ -469,15 +483,34 @@ export function mountScrollWorld(container, config) {
     // Under prefers-reduced-motion we never load the clips at all — the stills stay up
     // and simply cross-dissolve as you scroll. No scrubbed video motion, no decode cost.
     if (reduce || s.hasClip || !s.clip) return;
-    // PATCH 22: abortable (the visitor jumped away) and with a timeout (a stalled
-    // request must not block every other clip).
+    // PATCH 22: abortable (the visitor jumped away) and with a stall timeout: a
+    // request that receives nothing for LOAD_TIMEOUT must not block every other
+    // clip, but a slow, steady download is never cut (on a 2 Mbps line a desktop
+    // clip takes ~35 s).
     const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
-    const load = inflight = { s, ctrl, timedOut: false, timer: 0 };
-    load.timer = setTimeout(() => { load.timedOut = true; if (ctrl) ctrl.abort(); }, LOAD_TIMEOUT);
+    const load = inflight = { s, ctrl, timer: 0, aborted: false };
+    const arm = () => {
+      clearTimeout(load.timer);
+      load.timer = setTimeout(() => { if (ctrl) ctrl.abort(); }, LOAD_TIMEOUT);
+    };
+    arm();
     // Serve the lighter mobile encode on phones when one was provided.
     const url = (isMobile() && s.clipM) ? s.clipM : s.clip;
     fetch(url, ctrl ? { signal: ctrl.signal } : undefined)
-      .then(r => r.ok ? r.blob() : Promise.reject(new Error(String(r.status))))
+      .then(r => {
+        if (!r.ok) throw new Error(String(r.status));
+        if (!r.body || typeof r.body.getReader !== 'function') return r.blob();
+        const reader = r.body.getReader(), parts = [];
+        const type = r.headers.get('content-type') || 'video/mp4';
+        const pump = () => reader.read().then(({ done, value }) => {
+          if (done) return new Blob(parts, { type });
+          parts.push(value);
+          arm();
+          return pump();
+        });
+        arm();
+        return pump();
+      })
       .then(blob => {
         clearTimeout(load.timer);
         if (inflight === load) inflight = null;
@@ -574,7 +607,8 @@ export function mountScrollWorld(container, config) {
         // PATCH 22: an unpainted connector dissolves from its origin still, which
         // can sit further than the window (long bands): load it with the connector.
         const o = i > 0 ? SEGMENTS[i - 1] : null;
-        if (s.kind === 'conn' && !s.painted && o && o.poster && !o.img.getAttribute('src')) o.img.src = o.poster;
+        // (After the first still, so a deep link's hero isn't slowed by it.)
+        if (s.kind === 'conn' && !s.painted && o && o.poster && !o.img.getAttribute('src') && (postersReady || i === ci)) o.img.src = o.poster;
         if (!heroArmed && i === ci) {
           heroArmed = true;
           if (s.img.getAttribute('src')) {
@@ -665,9 +699,9 @@ export function mountScrollWorld(container, config) {
   // only forward along the last scroll direction, so it finishes a move and never
   // pulls a visitor back. Ranges are in viewports beyond the stop's own band.
   function maybeSnap(now) {
-    // No snap before the visitor has touched anything: a restored scroll position
-    // on reload is not a direction.
-    if (!SNAP || !snapEnabled || snapAnim || jump || touching || mouseDown || booting || !lastInputAt) return;
+    // No snap until the visitor has scrolled since the page loaded: a restored
+    // position (reload, Back) is not a direction, nor is a click or a Tab.
+    if (!SNAP || !snapEnabled || snapAnim || jump || touching || mouseDown || booting || !dirKnown) return;
     if (now - Math.max(lastInputAt, lastScrollAt) < SNAP.idle) return;
     // Nearly arrived is enough: the spring's last pixels take a second or more,
     // and the glide simply carries its remaining drift on (same direction).
@@ -707,19 +741,24 @@ export function mountScrollWorld(container, config) {
     if (stopped) return;
     // Scheduled first: an exception below costs one frame, not the whole flight.
     rafId = requestAnimationFrame(frame);
-    const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 1 / 60;
+    // Real elapsed time for the scroll's speed; capped for the spring, so a stalled
+    // main thread doesn't make it jump.
+    const elapsed = lastFrame ? Math.max(0.001, (now - lastFrame) / 1000) : 1 / 60;
+    const dt = Math.min(0.1, elapsed);
     lastFrame = now;
     rawY = window.scrollY || window.pageYOffset || 0;
     if (snapAnim) stepSnap(now);
     const step = rawY - lastRawY;
-    rawSpeed += (Math.abs(step) / dt - rawSpeed) * (1 - Math.exp(-dt / 0.1));   // ~100 ms average
+    rawSpeed += (Math.abs(step) / elapsed - rawSpeed) * (1 - Math.exp(-elapsed / 0.1));   // ~100 ms average
     if (step) {
-      if (!booting) scrollDir = step > 0 ? 1 : -1;   // a restored position is not a direction
+      // A restored position is not a direction; a step after the visitor's input is.
+      if (!booting) { scrollDir = step > 0 ? 1 : -1; if (lastInputAt) dirKnown = true; }
       lastRawY = rawY;
     }
     if (jump) stepJump(now);
     if (reduce || booting) { vy = rawY; vel = 0; }
     else if (!jump && Math.abs(rawY - vy) > TELEPORT_GAP * vh && rawSpeed > TELEPORT_SPEED * vh) startJump(null);
+    else if (jump && jump.phase === 'out') vel = 0;   // hold the picture until the veil covers it
     else vy = damp(vy, rawY, dt);
     if (dirty || Math.abs(vy - renderedY) > 0.05) render(vy);
     pumpLoads(vy, now);
@@ -762,7 +801,11 @@ export function mountScrollWorld(container, config) {
   on('touchend', touchEnd, { passive: true });
   on('touchcancel', touchEnd, { passive: true });
   on('pointerdown', e => { if (e.pointerType === 'mouse') { onInput(); mouseDown = true; } }, { passive: true });
-  on('pointerup', e => { if (e.pointerType === 'mouse') { mouseDown = false; lastInputAt = performance.now(); } }, { passive: true });
+  const mouseUp = () => { mouseDown = false; lastInputAt = performance.now(); };
+  on('pointerup', e => { if (e.pointerType === 'mouse') mouseUp(); }, { passive: true });
+  // A native drag (a link, selected text) ends in pointercancel/dragend, not pointerup.
+  on('pointercancel', e => { if (e.pointerType === 'mouse') mouseUp(); }, { passive: true });
+  on('dragend', mouseUp, { passive: true });
   on('blur', () => { mouseDown = false; touching = false; });
   on('scroll', () => { if (!snapAnim) lastScrollAt = performance.now(); }, { passive: true });
 
@@ -804,6 +847,7 @@ export function mountScrollWorld(container, config) {
     // Accepts a section index or id. PATCH 19: fades to the stop; `instant` moves
     // there at once (deep links on load).
     jumpTo(target, opts) {
+      if (stopped) return false;
       const i = typeof target === 'number' ? target : SECTIONS.findIndex(s => s.id === target);
       if (i < 0 || i >= N) return false;
       if (opts && opts.instant) {
@@ -814,7 +858,7 @@ export function mountScrollWorld(container, config) {
       return true;
     },
     // PATCH 20: pause the snap while something covers the page (e.g. a menu).
-    setSnap(enabled) { snapEnabled = !!enabled; if (!enabled) cancelSnap(); },
+    setSnap(enabled) { if (stopped) return; snapEnabled = !!enabled; if (!enabled) cancelSnap(); },
     // PATCH 1: stop the loop, remove the listeners and media, empty the container
     // (client-side routers, hot reload, StrictMode double mounts).
     destroy() {
@@ -832,6 +876,7 @@ export function mountScrollWorld(container, config) {
       blobUrls.forEach(u => URL.revokeObjectURL(u));
       container.innerHTML = '';
       container.classList.remove('sw-root');
+      container.style.removeProperty('--sw-accent');
     },
   };
 
