@@ -1,5 +1,10 @@
 # Pipeline
 
+> **Historical record.** This is how the first build (then called "Maravilla")
+> generated its frames and clips. Its encode steps (one concatenated video with
+> few keyframes) are obsolete: the current encode, stills and pacing are in
+> `docs/architecture.md`.
+
 ## 1. Frames (6 jobs, 1 credit each)
 Sequential — each depends on the previous:
 ```

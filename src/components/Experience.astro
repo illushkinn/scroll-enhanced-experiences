@@ -23,6 +23,10 @@ const config = {
   atmosphere: false,
   stillMotion: false,
   connScroll: pacing.connScroll,
+  connectorTimeMaps: pacing.connectorTimeMaps,
+  damping: pacing.damping,
+  snap: pacing.snap,
+  fps: pacing.fps,
   crossfade: pacing.crossfade,
   sections,
   connectors,
@@ -161,6 +165,7 @@ const pad = (n: number) => String(n).padStart(2, '0');
 
   interface WorldApi {
     jumpTo(target: number | string, opts?: { instant?: boolean }): boolean;
+    setSnap(on: boolean): void;
   }
 
   const root = document.getElementById('world');
@@ -247,6 +252,7 @@ const pad = (n: number) => String(n).padStart(2, '0');
     if (!menu || !openButton) return;
     menu.hidden = false;
     setOutsideInert(true);
+    api?.setSnap(false); // the page must not glide behind the open dialog
     document.documentElement.classList.add('is-menu-open');
     openButton.setAttribute('aria-expanded', 'true');
     const current = items.find((item) => item.dataset.stop === activeId);
@@ -257,6 +263,7 @@ const pad = (n: number) => String(n).padStart(2, '0');
     if (!menu || !openButton || menu.hidden) return;
     menu.hidden = true;
     setOutsideInert(false); // before focusing the (header) button again
+    api?.setSnap(true);
     document.documentElement.classList.remove('is-menu-open');
     openButton.setAttribute('aria-expanded', 'false');
     if (restoreFocus) openButton.focus();
