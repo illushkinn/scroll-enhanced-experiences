@@ -74,9 +74,9 @@ export const connectorsMobile = CLIPS.map((clip) => media(`clips/${clip}-m.mp4`)
 export const pacing = {
   /**
    * Viewport-heights of scroll per 4 s clip, one per clip. They grow with how much
-   * each clip moves (mean frame-to-frame change on the -m encodes: c1 ≈ 0.8,
-   * c2 ≈ 2.0, c3 ≈ 1.2, c4 ≈ 17.7 — the fly-up into the penthouse moves 10–20×
-   * more than the others), not in proportion: c4 would need ~20 viewports.
+   * each clip moves (mean frame-to-frame change, as scripts/time-maps.mjs measures
+   * it: c1 ≈ 0.6, c2 ≈ 1.4, c3 ≈ 0.9, c4 ≈ 12.7 — the fly-up into the penthouse
+   * moves 9–21× more than the others), not in proportion: c4 would need ~20.
    */
   connScroll: [2, 2.4, 2.2, 4.5],
   /**
@@ -86,12 +86,24 @@ export const pacing = {
    */
   connectorTimeMaps: CLIPS.map((clip) => timeMaps.maps[clip]),
   /**
-   * Fraction of the gap between the video and the scroll position closed per
-   * 1/60 s (0–1), frame-rate independent: 0.1 ≈ a 160 ms time constant at any
-   * refresh rate. Lower = more weight and less mouse-wheel jitter; the engine
-   * default is 0.18.
+   * How the picture follows the scroll. Everything on screen (video frame,
+   * layers, copy, route) renders from one position that trails the browser's
+   * scroll through a critically damped spring: `smoothTime` seconds to settle
+   * (shorter on touch, where the finger already gives inertia), never faster
+   * than `maxSpeed` viewports per second (the cap loosens once the picture
+   * lags 2 viewports behind, so a fast scroll stays continuous), and a jump —
+   * a gap wider than `teleportGap` viewports opened faster than `teleportSpeed`
+   * viewports/s (End key, scrollbar) — fades instead of flying through.
    */
-  smoothing: 0.1,
+  damping: { smoothTime: 0.45, touchSmoothTime: 0.3, maxSpeed: 3, teleportGap: 4, teleportSpeed: 15 },
+  /**
+   * Soft snap: after `idle` ms at rest within `range` viewports of a stop whose
+   * copy isn't fully shown, the page glides on to that stop — only in the
+   * direction the visitor was already scrolling.
+   */
+  snap: { idle: 400, range: 0.5 },
+  /** Frame rate of the clips (seeks land on whole frames). */
+  fps: 24,
   /**
    * Seam window (viewport-heights): how far before a seam the next layer is kept
    * in sync underneath. Layers swap with a cut — the seams are frame-matched, so

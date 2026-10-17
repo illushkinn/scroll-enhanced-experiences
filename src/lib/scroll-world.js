@@ -27,6 +27,14 @@
        ],
        connectors: [clipUrl, …],          // length = sections.length - 1 (nulls allowed)
        connectorsMobile: [clipUrl, …],    // optional lighter connectors for phones (same length)
+       // Local patches (see the list below):
+       connScroll: [2, 2.4, …],           // or one length per connector (PATCH 15)
+       connectorTimeMaps: [[0, …, 1], …], // per-connector scroll→time tables (PATCH 15)
+       damping: { smoothTime: 0.45, touchSmoothTime: 0.3, maxSpeed: 3,
+                  teleportGap: 4, teleportSpeed: 15 },          // PATCH 17, 19
+       snap: { idle: 400, range: 0.5 },   // or false (PATCH 20)
+       fps: 24,                           // clip frame rate (PATCH 18)
+       initialSection: 'id', onActive(index) {}, // PATCH 13, 6
 
    MOBILE (the clipMobile/connectorsMobile variants are the opt-in mobile version;
    the rest of the phone handling below is always on)
@@ -65,7 +73,9 @@
    LOCAL PATCHES (Libertad Buildings) — copied from the scroll-world skill's
    references/scrub-engine.js. Every change is tagged `PATCH` so the file can be
    re-synced with the skill:
-     1. ES module: `export function mountScrollWorld`, returns { jumpTo, sectionIds }.
+     1. ES module: `export function mountScrollWorld`, returns { jumpTo, setSnap,
+        destroy, sectionIds }; destroy() stops the loop and removes listeners
+        and media.
      2. `stillMotion: false` turns off the Ken-Burns scale/offset on stills. Needed
         when stills are real video frames (stops between connectors): any scale
         on the still would pop against the unscaled clip at each seam.
@@ -85,18 +95,45 @@
     11. Copy drift is a CSS custom property (--sw-copy-dy), so desktop keeps its
         translateY(-50%) centring instead of hanging from the 50% line.
     12. The decorative stage is aria-hidden (no unnamed <video> nodes).
-    13. `initialSection` (id) positions the page before the first read(), so a
+    13. `initialSection` (id) positions the page before the first render, so a
         deep link only fetches the clips around its target.
     14. Stills load lazily in the clip load window (lazy-loading never deferred
         them in a fixed stage); the first visible still gets high priority and
         clips wait for it (or for window load).
     15. Connector pacing: `connScroll` may be an array (one length per clip; capped
-        at 1 viewport under reduced motion, where a band only holds a still),
+        at 1 viewport under reduced motion, where a band only holds a still) and
         `connectorTimeMaps` gives each clip a scroll→time table (built from its
-        measured motion, with zero speed at both seams), and `smoothing` is the
-        rAF lerp per 1/60 s (default 0.18).
-    16. The scrub lerp advances every frame (it stalled while a seek was in
-        flight) and is frame-rate independent.
+        measured motion, with zero speed at both seams).
+    16. (Superseded by 17: the per-video lerp is gone.)
+    17. One smoothed scroll position drives everything. `vy` follows the
+        browser's scroll through a critically damped spring with a speed cap
+        that loosens once it lags more than 2 viewports (`damping: {
+        smoothTime, touchSmoothTime, maxSpeed }`), and
+        layers, copy, route, progress bar and video frames are all rendered from
+        it in a single rAF loop. Before, layers and copy followed the raw scroll
+        while the video lagged behind a lerp, so every seam cut to the next layer
+        before the video had arrived (7–38 frames skipped at 1–4 viewports/s).
+    18. Whole-frame seeks: the frame index comes straight from `vy` (`fps`,
+        default 24) and a seek is issued only when it changes, aimed at the
+        middle of the frame.
+    19. Jumps (route dots, `api.jumpTo`, and a gap wider than `teleportGap`
+        viewports while the scroll moves faster than `teleportSpeed` viewports/s,
+        i.e. End key or scrollbar, never a hand) fade the stage out, move, and
+        fade back in, instead of smooth-scrolling through every clip in between
+        (which also downloaded all of them).
+    20. Directional soft snap (`snap: { idle, range }` or `false`): after a
+        pause, a resting point near a stop finishes the move toward that stop,
+        never against the last scroll direction. Off under reduced motion,
+        while touching and while `api.setSnap(false)` (e.g. a menu is open).
+    21. Copy holds a plateau: middle stops are fully visible over the central
+        60 % of their band, the hero over its first 30 %.
+    22. Clips load one at a time, nearest first and ahead in the scroll
+        direction, retrying with backoff (2/4/8 s) instead of every frame; a
+        download is aborted when the visitor moves away and times out after
+        30 s. A connector whose clip hasn't painted dissolves origin →
+        destination still (also the reduced-motion behaviour), and a clip fades
+        in once painted, over that dissolve.
+    23. Resizing or rotating keeps the visitor at the same point of the story.
    ========================================================================== */
 
 // PATCH 1: ES module export (was a global + CommonJS shim at the bottom).
@@ -126,7 +163,24 @@ export function mountScrollWorld(container, config) {
       t.every((v, k) => typeof v === 'number' && (k === 0 || v >= t[k - 1]));
     return ok ? t : null;
   };
-  const SMOOTHING = (config.smoothing > 0 && config.smoothing <= 1) ? config.smoothing : 0.18;   // PATCH 15
+  const posNum = (v, d) => (typeof v === 'number' && v > 0) ? v : d;
+  // PATCH 17: spring time (s), speed cap (viewports/s) and the gap (viewports)
+  // beyond which the stage fades to the scroll position instead of flying there.
+  const DAMP = config.damping || {};
+  const SMOOTH_TIME = posNum(coarse ? DAMP.touchSmoothTime : 0, posNum(DAMP.smoothTime, 0.45));
+  const MAX_SPEED = posNum(DAMP.maxSpeed, Infinity);
+  const TELEPORT_GAP = posNum(DAMP.teleportGap, 4);
+  // A jump is a discontinuity: the gap must be wide AND the scroll must be moving
+  // faster than any hand does (End key, scrollbar click or fast drag, anchors).
+  const TELEPORT_SPEED = posNum(DAMP.teleportSpeed, 15);
+  // Past this lag (viewports) the speed cap loosens in proportion, so a fast but
+  // continuous scroll stays a continuous flight instead of falling ever further behind.
+  const CATCH_UP = 2;
+  const FPS = posNum(config.fps, 24);                                       // PATCH 18
+  const SNAP = (config.snap === false || reduce) ? null : {                 // PATCH 20
+    idle: posNum(config.snap && config.snap.idle, 400),
+    range: posNum(config.snap && config.snap.range, 0.5),
+  };
   const CROSSFADE = (config.crossfade != null) ? config.crossfade : 0.12;  // seam dissolve width (vh)
   const STILL_MOTION = config.stillMotion !== false;                       // PATCH 2
   const DEFAULT_FOCUS = [50, 42];                                          // PATCH 4
@@ -194,9 +248,11 @@ export function mountScrollWorld(container, config) {
   const hintText = el('span'); hintText.textContent = config.hint || 'scroll'; hint.appendChild(hintText);
   hint.appendChild(el('i'));
   const track = el('div', 'sw-track');
+  // PATCH 19: covers the stage and copy while a jump moves the camera.
+  const veil = el('div', 'sw-veil');
 
   // PATCH 7: skip the topbar when it has nothing in it (the page brings its own header).
-  [sky, scrollbar, topbar, stage, copylayer, route, hint, track]
+  [sky, scrollbar, topbar, stage, copylayer, veil, route, hint, track]
     .filter(n => n !== topbar || topbar.childNodes.length)
     .forEach(n => container.appendChild(n));
 
@@ -206,13 +262,14 @@ export function mountScrollWorld(container, config) {
     const img = el('img', 'sw-scene__still'); img.alt = ''; img.decoding = 'async';
     // PATCH 14: every still sits in a fixed full-viewport stage, so loading="lazy"
     // never deferred anything — all of them downloaded at first paint, competing
-    // with the hero. The URL is kept here and assigned by read() only when the
+    // with the hero. The URL is kept here and assigned by render() only when the
     // segment is inside the same load window as its clip.
     s.poster = (isMobile() && s.stillM) ? s.stillM : s.still;
     img.style.objectPosition = focusAt(s, 0);   // PATCH 4
     scene.appendChild(img); stage.appendChild(scene);
     s.el = scene; s.img = img; s.video = null; s.hasClip = false;
-    s.loading = false; s.ready = false; s.cur = 0; s.target = 0; s.visible = false;
+    s.ready = false; s.painted = false; s.target = 0;
+    s.frame = -1; s.frames = 2; s.failed = 0; s.retryAt = 0;   // PATCH 18, 22
   });
 
   // per-section copy / route / nav
@@ -256,16 +313,36 @@ export function mountScrollWorld(container, config) {
     const k = Math.min(Math.floor(p), table.length - 2);
     return table[k] + (table[k + 1] - table[k]) * (p - k);
   };
-  let vh = window.innerHeight, stageX = 0, totalW = 0, activeIndex = -1, ticking = false;
+  let vh = window.innerHeight, stageX = 0, totalW = 0, activeIndex = -1;
   let laidOutW = window.innerWidth;   // width the current layout was computed at (see onResize)
   // PATCH 14: clips wait until the still on screen at mount has loaded (or the page
   // has), so the first image the visitor sees doesn't share bandwidth with a clip.
   let postersReady = false, heroArmed = false;
-  function onHeroPoster() { if (postersReady) return; postersReady = true; read(); }
+  function onHeroPoster() { if (postersReady) return; postersReady = true; dirty = true; }
 
-  // PATCH 13: `skipRead` lets mount position the page before the first read(),
+  // PATCH 17: `rawY` is the browser's scroll position, `vy` the smoothed one that
+  // everything on screen is rendered from; `vel` is the spring's velocity (px/s).
+  // Until the page has loaded (or the visitor touches anything) vy just mirrors
+  // rawY, so a restored scroll position or a deep link doesn't fly in from the top.
+  let rawY = window.scrollY || window.pageYOffset || 0, lastRawY = rawY, scrollDir = 1;
+  let vy = rawY, vel = 0, renderedY = NaN, dirty = true, booting = true;
+  // PATCH 19: jump state ({ phase: 'out' | 'hold' | 'in', t0, from, top }).
+  let jump = null, veilOpacity = 0;
+  // PATCH 20: snap state.
+  let snapAnim = null, snapEnabled = true, snapCheckedAt = NaN;
+  let lastInputAt = 0, lastScrollAt = 0, touching = false, mouseDown = false;
+  let rawSpeed = 0;   // PATCH 19: smoothed speed of the browser's scroll (px/s)
+  // PATCH 22: the one clip being downloaded ({ s, ctrl, timer }).
+  let inflight = null;
+  let rafId = 0, stopped = false;
+
+  // PATCH 13: `skipRender` lets mount position the page before the first render,
   // so a deep link doesn't start loading the clips around the top first.
-  function layout(skipRead) {
+  // PATCH 23: a relayout (resize, rotation) keeps both positions at the same point
+  // of the story instead of the same pixel offset.
+  function layout(skipRender) {
+    const keep = SEGMENTS[0].end != null
+      ? { raw: storyPos(window.scrollY || window.pageYOffset || 0), v: storyPos(vy) } : null;
     vh = window.innerHeight;
     laidOutW = window.innerWidth;
     stageX = window.innerWidth > 860 ? 4 : 0;
@@ -273,12 +350,29 @@ export function mountScrollWorld(container, config) {
     SEGMENTS.forEach(s => { s.start = off * vh; off += s.w; s.end = off * vh; });
     totalW = off;
     track.style.height = (totalW * vh + vh) + 'px';   // +1vh so the last flight completes
-    if (skipRead !== true) read();
+    if (keep) {
+      const y = Math.round(fromStory(keep.raw));
+      if (Math.abs(y - (window.scrollY || 0)) > 1) window.scrollTo(0, y);
+      rawY = lastRawY = window.scrollY || 0;
+      vy = fromStory(keep.v); vel = 0;
+      cancelSnap();
+    }
+    dirty = true;
+    if (skipRender !== true) render(vy);
+  }
+  function storyPos(y) {
+    let i = 0;
+    for (let k = 0; k < NSEG; k++) if (y >= SEGMENTS[k].start) i = k;
+    const s = SEGMENTS[i];
+    return { i, p: (y - s.start) / ((s.end - s.start) || 1) };
+  }
+  function fromStory(pos) {
+    const s = SEGMENTS[pos.i];
+    return s.start + clamp(pos.p) * (s.end - s.start);
   }
 
-  function jumpTo(i) {
-    window.scrollTo({ top: jumpTarget(i), behavior: reduce ? 'auto' : 'smooth' });
-  }
+  // PATCH 19: route dots and the page's menu move with a fade, not a scroll.
+  function jumpTo(i) { startJump(i); }
 
   // PATCH 8: the hero's copy greets on landing and is already fading by mid-scene,
   // so jumping to the first section goes to the very top instead of its midpoint.
@@ -288,54 +382,199 @@ export function mountScrollWorld(container, config) {
     return seg.start + (seg.end - seg.start) * 0.5;
   }
 
+  // PATCH 19: fade the stage out, move both positions at once while it is covered
+  // (so nothing scrubs through the clips in between, and only the destination's
+  // media loads), wait for the destination still, fade back in. `si` is the
+  // section to land on (its offset is read at the covered moment, so a resize
+  // mid-jump still lands right); null = the browser already scrolled (End key,
+  // scrollbar): just catch vy up.
+  const JUMP_OUT = 200, JUMP_IN = 320, JUMP_HOLD_MAX = 1200;
+  function startJump(si) {
+    cancelSnap();
+    if (si != null && !jump && Math.abs(jumpTarget(si) - rawY) < 2 && Math.abs(vy - rawY) < 2) return;   // already there
+    if (reduce) {
+      if (si != null) window.scrollTo(0, Math.round(jumpTarget(si)));
+      rawY = lastRawY = window.scrollY || 0; vy = rawY; vel = 0; dirty = true;
+      return;
+    }
+    jump = { phase: 'out', t0: performance.now(), from: veilOpacity, si };
+  }
+  function stepJump(now) {
+    if (jump.phase === 'out') {
+      const k = clamp((now - jump.t0) / JUMP_OUT);
+      setVeil(jump.from + (1 - jump.from) * k);
+      if (k < 1) return;
+      if (jump.si != null) window.scrollTo(0, Math.round(jumpTarget(jump.si)));
+      rawY = lastRawY = window.scrollY || 0; vy = rawY; vel = 0;
+      abortStaleLoad(vy);
+      render(vy);
+      jump = { phase: 'hold', t0: now };
+    }
+    if (jump.phase === 'hold') {
+      // The images the landing shows: its own still and, for a connector whose
+      // clip hasn't painted, the origin still it dissolves from. A broken image
+      // counts as done (`complete` is true for it too).
+      const ci = segmentAt(vy), s = SEGMENTS[ci];
+      const imgs = [s.img];
+      if (s.kind === 'conn' && !s.painted && ci > 0) imgs.push(SEGMENTS[ci - 1].img);
+      const loaded = imgs.every(img => !img.getAttribute('src') || img.complete);
+      if (!loaded && now - jump.t0 < JUMP_HOLD_MAX) return;
+      jump = { phase: 'in', t0: now };
+    }
+    const k = clamp((now - jump.t0) / JUMP_IN);
+    setVeil(1 - smooth(k));
+    if (k >= 1) jump = null;
+  }
+  function setVeil(op) {
+    veilOpacity = op;
+    veil.style.opacity = op > 0.001 ? op.toFixed(3) : '0';
+  }
+
+  // PATCH 17: critically damped spring (Unity's SmoothDamp, the same maths as
+  // maath's easing.damp used by drei/R3F scroll sites). Unlike a lerp it eases
+  // into every scroll input instead of starting at full speed, it never
+  // overshoots, and capping the change caps the speed at MAX_SPEED viewports/s.
+  function damp(cur, target, dt) {
+    const omega = 2 / SMOOTH_TIME, x = omega * dt;
+    const exp = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+    const lag = Math.abs(target - cur) / (CATCH_UP * vh);
+    const maxChange = MAX_SPEED * Math.max(1, lag) * vh * SMOOTH_TIME;
+    const change = clamp(cur - target, -maxChange, maxChange);
+    const temp = (vel + omega * change) * dt;
+    vel = (vel - omega * temp) * exp;
+    let out = cur - change + (change + temp) * exp;
+    if ((target - cur > 0) === (out > target)) { out = target; vel = 0; }
+    return out;
+  }
+
+  function segmentAt(y) {
+    let ci = 0;
+    for (let i = 0; i < NSEG; i++) if (y >= SEGMENTS[i].start) ci = i;
+    return ci;
+  }
+
+  // PATCH 21: copy opacity for section i at position y. Middle stops are fully
+  // visible over the central 60 % of their band (it used to peak at a single
+  // point), the hero over its first 30 %, the last stop from 40 % to the end.
+  function copyOpacity(i, y) {
+    const seg = SECTIONS[i]._seg;
+    const pr = clamp((y - seg.start) / (seg.end - seg.start), 0, 1);
+    const before = y < seg.start, after = y > seg.end;
+    if (i === 0) return after ? 0 : (pr <= 0.3 ? 1 : smooth(1 - (pr - 0.3) / 0.32));   // greets on landing
+    if (i === N - 1) return before ? 0 : smooth(pr / 0.4);                             // holds CTA at the end
+    return (before || after) ? 0 : smooth((0.5 - Math.abs(pr - 0.5)) / 0.2);
+  }
+
   function loadClip(s) {
     // Under prefers-reduced-motion we never load the clips at all — the stills stay up
     // and simply cross-dissolve as you scroll. No scrubbed video motion, no decode cost.
-    if (reduce || s.loading || !s.clip) return;
-    s.loading = true;
+    if (reduce || s.hasClip || !s.clip) return;
+    // PATCH 22: abortable (the visitor jumped away) and with a timeout (a stalled
+    // request must not block every other clip).
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const load = inflight = { s, ctrl, timedOut: false, timer: 0 };
+    load.timer = setTimeout(() => { load.timedOut = true; if (ctrl) ctrl.abort(); }, LOAD_TIMEOUT);
     // Serve the lighter mobile encode on phones when one was provided.
     const url = (isMobile() && s.clipM) ? s.clipM : s.clip;
-    fetch(url).then(r => r.ok ? r.blob() : Promise.reject(new Error('404')))
+    fetch(url, ctrl ? { signal: ctrl.signal } : undefined)
+      .then(r => r.ok ? r.blob() : Promise.reject(new Error(String(r.status))))
       .then(blob => {
+        clearTimeout(load.timer);
+        if (inflight === load) inflight = null;
+        if (stopped) return;
         const v = document.createElement('video');
         v.className = 'sw-scene__video';
         v.muted = true; v.playsInline = true; v.preload = 'auto';
         v.setAttribute('muted', ''); v.setAttribute('playsinline', '');
         v.src = URL.createObjectURL(blob);
-        v.style.objectPosition = focusAt(s, s.cur);   // PATCH 4
+        v.style.objectPosition = focusAt(s, s.target);   // PATCH 4
         v.addEventListener('loadedmetadata', () => {
-          // PATCH 9: start on the frame the scroll position asks for. A connector's
-          // poster is its destination still, so lerping up from cur=0 would show the
-          // origin frame and replay the flight when a clip lands mid-connector.
-          s.cur = s.target;
-          try { v.currentTime = clamp(s.target, 0, 0.999) * v.duration; } catch (e) {}
-          v.style.objectPosition = focusAt(s, s.target);
-          s.ready = true; read();
+          // PATCH 9 + 18: the next frame seeks straight to the frame vy asks for, so a
+          // clip that lands mid-connector never replays the flight from frame 0.
+          const d = isFinite(v.duration) && v.duration > 0 ? v.duration : 1;
+          s.frames = Math.max(2, Math.round(d * FPS));
+          s.frame = -1; s.ready = true; dirty = true;
         });
-        // Reveal the video (hide the still poster) only once a real frame has
-        // painted — on iOS a seeked-but-never-played muted video stays blank, so
-        // hiding the still on metadata alone would flash an empty scene.
-        v.addEventListener('seeked', () => { s.el.classList.add('has-clip'); }, { once: true });
-        v.addEventListener('loadeddata', () => { try { v.pause(); } catch (e) {} if (userReady) primeVideo(v); });
+        // Reveal the video only once a real frame has painted — on iOS a
+        // seeked-but-never-played muted video stays blank. PATCH 22: it fades in
+        // over the still (CSS, 0.25 s); a dissolve underneath keeps its origin
+        // still until the fade is over, or the screen would dip to the background.
+        v.addEventListener('seeked', () => {
+          s.el.classList.add('has-clip');
+          setTimeout(() => { s.painted = true; dirty = true; }, REVEAL_MS);
+        }, { once: true });
+        v.addEventListener('loadeddata', () => { try { v.pause(); } catch (e) {} if (userReady) primeVideo(v, s); });
         s.el.appendChild(v); s.video = v; s.hasClip = true;
-      }).catch(() => { s.loading = false; });
+        blobUrls.push(v.src);
+      }).catch(() => {
+        clearTimeout(load.timer);
+        if (inflight === load) inflight = null;
+        // Aborted because the visitor moved away: not a failure, it loads again
+        // when they come back.
+        if (load.aborted) return;
+        // PATCH 22: back off (2, 4, 8 s) instead of retrying on every frame; after
+        // the third retry the still simply stays up.
+        s.failed++;
+        s.retryAt = performance.now() + 1000 * Math.pow(2, s.failed);
+      });
+  }
+  // PATCH 22: drop the download in flight when its clip is no longer near vy.
+  function abortStaleLoad(y) {
+    const load = inflight;
+    if (!load || !load.ctrl) return;
+    const s = load.s, margin = (LOAD_WINDOW + 0.5) * vh;
+    if (y > s.start - margin && y < s.end + margin) return;
+    load.aborted = true;
+    inflight = null;
+    clearTimeout(load.timer);
+    load.ctrl.abort();
   }
 
-  function read() {
-    const y = window.scrollY || window.pageYOffset;
+  // PATCH 22: one download at a time. Among the clips within 1.6 viewports of vy,
+  // the nearest goes first, and a clip behind the scroll direction waits for one
+  // ahead at a similar distance.
+  const LOAD_WINDOW = 1.6, MAX_RETRIES = 3, LOAD_TIMEOUT = 30000, REVEAL_MS = 300;
+  const blobUrls = [];
+  function pumpLoads(y, now) {
+    if (reduce || !postersReady) return;
+    abortStaleLoad(y);
+    if (inflight) return;
+    let best = null, bestScore = Infinity;
+    for (let i = 0; i < NSEG; i++) {
+      const s = SEGMENTS[i];
+      if (!s.clip || s.hasClip || s.failed > MAX_RETRIES || now < s.retryAt) continue;
+      if (y <= s.start - LOAD_WINDOW * vh || y >= s.end + LOAD_WINDOW * vh) continue;
+      const d = y < s.start ? s.start - y : y > s.end ? y - s.end : 0;
+      const behind = scrollDir > 0 ? y > s.end : y < s.start;
+      const score = d + (behind ? 0.75 * vh : 0);
+      if (score < bestScore) { bestScore = score; best = s; }
+    }
+    if (best) loadClip(best);
+  }
+
+  // PATCH 17: everything visible is a function of one position, y = vy.
+  function render(y) {
+    renderedY = y; dirty = false;
     const fade = CROSSFADE * vh;
-    let ci = 0;
-    for (let i = 0; i < NSEG; i++) if (y >= SEGMENTS[i].start) ci = i;
+    const ci = segmentAt(y);
+    // PATCH 22: a connector on screen whose clip hasn't painted keeps its origin
+    // stop underneath and dissolves its destination still in over the band.
+    const cur = SEGMENTS[ci];
+    const dissolve = cur.kind === 'conn' && !cur.painted ? ci : -1;
 
     for (let i = 0; i < NSEG; i++) {
       const s = SEGMENTS[i];
-      if (y > s.start - 1.6 * vh && y < s.end + 1.6 * vh) {
+      if (y > s.start - LOAD_WINDOW * vh && y < s.end + LOAD_WINDOW * vh) {
         // PATCH 14: stills load in the same window as clips; the one on screen first
         // gets high priority and gates the clip downloads.
         if (s.poster && !s.img.getAttribute('src')) {
           if (i === ci) s.img.fetchPriority = 'high';
           s.img.src = s.poster;
         }
+        // PATCH 22: an unpainted connector dissolves from its origin still, which
+        // can sit further than the window (long bands): load it with the connector.
+        const o = i > 0 ? SEGMENTS[i - 1] : null;
+        if (s.kind === 'conn' && !s.painted && o && o.poster && !o.img.getAttribute('src')) o.img.src = o.poster;
         if (!heroArmed && i === ci) {
           heroArmed = true;
           if (s.img.getAttribute('src')) {
@@ -343,7 +582,6 @@ export function mountScrollWorld(container, config) {
             s.img.addEventListener('error', onHeroPoster, { once: true });
           } else postersReady = true;
         }
-        if (postersReady) loadClip(s);
       }
       const local = clamp((y - s.start) / (s.end - s.start), 0, 1);
       // PATCH 15: a connector's time map spreads its motion evenly over the band and
@@ -351,10 +589,13 @@ export function mountScrollWorld(container, config) {
       s.target = s.linger ? lingerEase(local, s.linger) : s.timeMap ? mapTime(s.timeMap, local) : local;
       let outside = 0;
       if (y < s.start) outside = s.start - y; else if (y > s.end) outside = y - s.end;
-      const op = smooth(1 - outside / fade);
-      s.el.style.opacity = op; s.visible = op > 0.001;
-      s.el.style.zIndex = (i === ci) ? '120' : String(100 + Math.round(op * 10));
-      if (!s.hasClip || !s.ready) {
+      let op = smooth(1 - outside / fade);
+      let z = (i === ci) ? 120 : 100 + Math.round(op * 10);
+      if (i === dissolve - 1) { op = 1; z = 119; }
+      s.el.style.opacity = op;
+      s.el.style.zIndex = String(z);
+      if (s.kind === 'conn' && !s.painted) s.img.style.opacity = smooth(local).toFixed(3);   // PATCH 22
+      if (!s.painted) {
         // PATCH 2: with stillMotion off the still is a real video frame and must sit
         // exactly where the clip will paint it — no offset, no zoom.
         if (STILL_MOTION) {
@@ -370,11 +611,7 @@ export function mountScrollWorld(container, config) {
     for (let i = 0; i < N; i++) {
       const seg = SECTIONS[i]._seg;
       const pr = clamp((y - seg.start) / (seg.end - seg.start), 0, 1);
-      const before = y < seg.start, after = y > seg.end;
-      let cop;
-      if (i === 0) cop = after ? 0 : smooth(1 - pr / 0.62);            // greets on landing
-      else if (i === N - 1) cop = before ? 0 : smooth(pr / 0.4);       // holds CTA at the end
-      else cop = (before || after) ? 0 : smooth(1 - Math.abs(pr - 0.5) / 0.5);
+      const cop = copyOpacity(i, y);
       const c = copies[i];
       c.style.opacity = cop;
       // PATCH 11: drift via a custom property so the CSS keeps each layout's base
@@ -384,7 +621,6 @@ export function mountScrollWorld(container, config) {
       c.style.pointerEvents = cop > 0.5 ? 'auto' : 'none';
     }
 
-    const cur = SEGMENTS[ci];
     const near = clamp(cur.kind === 'dive' ? cur.si
       : (((y - cur.start) / (cur.end - cur.start)) > 0.5 ? cur.si + 1 : cur.si), 0, N - 1);
     if (near !== activeIndex) {
@@ -396,41 +632,99 @@ export function mountScrollWorld(container, config) {
       });
       nav.querySelectorAll('.sw-nav__item').forEach((n, k) => n.classList.toggle('is-active', k === near));
       container.style.setProperty('--sw-accent', SECTIONS[near].accent || '');
-      if (typeof config.onActive === 'function') config.onActive(near);   // PATCH 6
+      // PATCH 6; a throwing host callback must not stop the flight.
+      if (typeof config.onActive === 'function') { try { config.onActive(near); } catch (e) { console.error(e); } }
     }
     scrollbarFill.style.transform = `scaleX(${clamp(y / (totalW * vh))})`;
     hint.style.opacity = clamp(1 - y / (0.5 * vh));
     if (particles) particles.style.transform = `translate3d(0, ${-y * 0.05}px, 0)`;
-    ticking = false;
   }
 
-  let lastFrame = 0;
-  function raf(now) {
-    // PATCH 16: smoothing is per 1/60 s, so 120 Hz screens feel the same as 60 Hz.
-    const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 1 / 60;
-    lastFrame = now;
-    const k = reduce ? 1 : 1 - Math.pow(1 - SMOOTHING, dt * 60);
-    const eps = isMobile() ? 0.02 : 0.008;   // coarser seek step on phones = fewer decodes
+  // PATCH 18: seek whole frames. The frame comes straight from vy (no second
+  // smoothing stage); a seek goes out only when the frame changes, aimed at the
+  // frame's middle so rounding can't land on a neighbour. Never queue a seek while
+  // the decoder is still resolving the last one: on phones a fast flick would
+  // otherwise pile up seeks and freeze the clip; the next free frame seeks
+  // straight to the latest target.
+  function scrub() {
     for (let i = 0; i < NSEG; i++) {
-      const s = SEGMENTS[i];
-      if (!s.hasClip || !s.ready || !s.video) continue;
-      if (!s.visible && Math.abs(s.cur - s.target) < 0.002) continue;
-      // PATCH 16: cur advances every frame. It used to stop while a seek was in
-      // flight, so the video lagged the scroll by as many lerp steps as there were
-      // slow seeks (worst on phones, and with heavier smoothing).
-      s.cur += (s.target - s.cur) * k;
-      // Never queue a seek while the decoder is still resolving the last one.
-      // On phones a fast flick would otherwise pile up seeks and freeze the clip;
-      // the next free frame seeks straight to the latest cur.
-      if (s.video.seeking) continue;
-      const dur = s.video.duration || 1;
-      const t = clamp(s.cur, 0, 0.999) * dur;
-      if (Math.abs(s.video.currentTime - t) > eps) { try { s.video.currentTime = t; } catch (e) {} }
+      const s = SEGMENTS[i], v = s.video;
+      if (!s.ready || !v || v.seeking) continue;
+      const f = Math.round(clamp(s.target) * (s.frames - 1));
+      if (f === s.frame) continue;
+      s.frame = f;
+      try { v.currentTime = (f + 0.5) / FPS; } catch (e) {}
       // PATCH 4: follow the frame actually requested, so the crop lands on the
       // origin focus at the first frame and on the destination focus at the last.
-      if (s.kind === 'conn') s.video.style.objectPosition = focusAt(s, t / dur);
+      if (s.kind === 'conn') v.style.objectPosition = focusAt(s, f / (s.frames - 1));
     }
-    requestAnimationFrame(raf);
+  }
+
+  // PATCH 20: after SNAP.idle ms without input, once the camera has nearly come to rest, a
+  // position near a stop whose copy isn't fully shown glides to that stop — but
+  // only forward along the last scroll direction, so it finishes a move and never
+  // pulls a visitor back. Ranges are in viewports beyond the stop's own band.
+  function maybeSnap(now) {
+    // No snap before the visitor has touched anything: a restored scroll position
+    // on reload is not a direction.
+    if (!SNAP || !snapEnabled || snapAnim || jump || touching || mouseDown || booting || !lastInputAt) return;
+    if (now - Math.max(lastInputAt, lastScrollAt) < SNAP.idle) return;
+    // Nearly arrived is enough: the spring's last pixels take a second or more,
+    // and the glide simply carries its remaining drift on (same direction).
+    if (Math.abs(rawY - vy) > 0.05 * vh) return;
+    if (snapCheckedAt === rawY) return;   // already judged this resting point
+    snapCheckedAt = rawY;
+    const R = SNAP.range * vh;
+    let to = null;
+    for (let i = 0; i < N; i++) {
+      const seg = SECTIONS[i]._seg;
+      if (rawY < seg.start - R || rawY > seg.end + R) continue;
+      if (copyOpacity(i, rawY) > 0.98) return;   // reading a stop: leave it
+      const t = Math.round(jumpTarget(i));
+      if ((t - rawY) * scrollDir <= 2) continue;   // behind: never pull back
+      if (to == null || Math.abs(t - rawY) < Math.abs(to - rawY)) to = t;
+    }
+    if (to == null) return;
+    const dist = Math.abs(to - rawY) / vh;
+    snapAnim = { from: rawY, to, t0: now, dur: 1000 * clamp(0.5 + 0.35 * dist, 0.6, 1.2), last: rawY };
+  }
+  function stepSnap(now) {
+    const a = snapAnim;
+    if (Math.abs(rawY - a.last) > 2) { snapAnim = null; return; }   // something else moved the page
+    const k = clamp((now - a.t0) / a.dur);
+    const e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(2 - 2 * k, 3) / 2;   // ease in-out
+    window.scrollTo(0, Math.round(a.from + (a.to - a.from) * e));
+    rawY = lastRawY = a.last = window.scrollY || 0;
+    if (k >= 1) { snapAnim = null; snapCheckedAt = rawY; }
+  }
+  function cancelSnap() { snapAnim = null; }
+  function onInput() { lastInputAt = performance.now(); booting = false; cancelSnap(); }
+
+  // PATCH 17: the only loop. It reads the scroll position once per frame, moves
+  // vy, renders from vy and seeks the videos to match.
+  let lastFrame = 0;
+  function frame(now) {
+    if (stopped) return;
+    // Scheduled first: an exception below costs one frame, not the whole flight.
+    rafId = requestAnimationFrame(frame);
+    const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 1 / 60;
+    lastFrame = now;
+    rawY = window.scrollY || window.pageYOffset || 0;
+    if (snapAnim) stepSnap(now);
+    const step = rawY - lastRawY;
+    rawSpeed += (Math.abs(step) / dt - rawSpeed) * (1 - Math.exp(-dt / 0.1));   // ~100 ms average
+    if (step) {
+      if (!booting) scrollDir = step > 0 ? 1 : -1;   // a restored position is not a direction
+      lastRawY = rawY;
+    }
+    if (jump) stepJump(now);
+    if (reduce || booting) { vy = rawY; vel = 0; }
+    else if (!jump && Math.abs(rawY - vy) > TELEPORT_GAP * vh && rawSpeed > TELEPORT_SPEED * vh) startJump(null);
+    else vy = damp(vy, rawY, dt);
+    if (dirty || Math.abs(vy - renderedY) > 0.05) render(vy);
+    pumpLoads(vy, now);
+    scrub();
+    maybeSnap(now);
   }
 
   // iOS needs a user gesture before a muted video will decode/paint reliably. On the
@@ -438,56 +732,106 @@ export function mountScrollWorld(container, config) {
   // instant instead of showing a blank frame. `userReady` also makes freshly-loaded
   // clips prime themselves (see loadClip).
   let userReady = false;
-  function primeVideo(v) {
+  function primeVideo(v, s) {
     if (!isMobile() || !v) return;
-    try { const p = v.play(); if (p && p.then) p.then(() => { try { v.pause(); } catch (e) {} }).catch(() => {}); }
+    // play() may advance the clip a little: re-seek to the target frame afterwards.
+    try { const p = v.play(); if (p && p.then) p.then(() => { try { v.pause(); } catch (e) {} if (s) s.frame = -1; }).catch(() => {}); }
     catch (e) {}
   }
   function onFirstGesture() {
     if (userReady) return;
     userReady = true;
-    SEGMENTS.forEach(s => primeVideo(s.video));
+    SEGMENTS.forEach(s => primeVideo(s.video, s));
   }
-  window.addEventListener('pointerdown', onFirstGesture, { once: true, passive: true });
-  window.addEventListener('touchstart', onFirstGesture, { once: true, passive: true });
+  // PATCH 1: every window listener goes through on(), so destroy() can remove it
+  // (since patches 19–20 an orphaned instance would otherwise keep scrolling the page).
+  const offs = [];
+  function on(type, fn, opts) {
+    window.addEventListener(type, fn, opts);
+    offs.push(() => window.removeEventListener(type, fn, opts));
+  }
+  on('pointerdown', onFirstGesture, { once: true, passive: true });
+  on('touchstart', onFirstGesture, { once: true, passive: true });
+
+  // PATCH 20: input bookkeeping for the snap (and to end `booting`). Scroll events
+  // only stamp the time: the frame loop reads the position itself.
+  on('wheel', onInput, { passive: true });
+  on('keydown', onInput);
+  on('touchstart', e => { onInput(); touching = e.touches.length > 0; }, { passive: true });
+  const touchEnd = e => { lastInputAt = performance.now(); touching = e.touches.length > 0; };
+  on('touchend', touchEnd, { passive: true });
+  on('touchcancel', touchEnd, { passive: true });
+  on('pointerdown', e => { if (e.pointerType === 'mouse') { onInput(); mouseDown = true; } }, { passive: true });
+  on('pointerup', e => { if (e.pointerType === 'mouse') { mouseDown = false; lastInputAt = performance.now(); } }, { passive: true });
+  on('blur', () => { mouseDown = false; touching = false; });
+  on('scroll', () => { if (!snapAnim) lastScrollAt = performance.now(); }, { passive: true });
 
   // Particles are a per-frame cost we can't afford alongside video scrubbing on a phone.
   seedParticles(particles, reduce || coarse);
-  window.addEventListener('scroll', () => { if (!ticking) { ticking = true; requestAnimationFrame(read); } }, { passive: true });
   // Mobile browsers fire `resize` every time the URL bar slides in/out. Re-running
   // layout() there rebuilds the track height and yanks the scroll position, so on
   // touch we ignore height-only changes and only relayout when the width actually
-  // changes (rotation still comes through orientationchange). layout() records the
-  // width it laid out at.
+  // changes. layout() records the width it laid out at.
   function onResize() {
-    if (coarse && window.innerWidth === laidOutW) return;
+    if (stopped || (coarse && window.innerWidth === laidOutW)) return;
     layout();
   }
-  window.addEventListener('resize', onResize);
-  window.addEventListener('orientationchange', layout);
-  window.addEventListener('load', () => { postersReady = true; layout(); });   // PATCH 14: fallback gate
+  on('resize', onResize);
+  // PATCH 23: some browsers fire orientationchange before the viewport has its new
+  // size; force the next resize through, with a timed fallback.
+  on('orientationchange', () => { laidOutW = -1; setTimeout(onResize, 400); });
+  // PATCH 14: fallback gate for the clips; PATCH 17: also ends `booting`. If the
+  // page has already loaded (module run late, bfcache), do it now.
+  const onLoad = () => { postersReady = true; booting = false; layout(); };
+  if (document.readyState === 'complete') { postersReady = true; booting = false; }
+  else on('load', onLoad);
   // PATCH 13: start at `initialSection` (e.g. from a URL hash) before the first
-  // read(), so only the clips around that section are fetched.
+  // render, so only the clips around that section are fetched.
   const initial = SECTIONS.findIndex(s => s.id === config.initialSection);
   if (initial > 0) {
     layout(true);
-    window.scrollTo({ top: jumpTarget(initial), behavior: 'auto' });
-    read();
+    window.scrollTo(0, jumpTarget(initial));
+    rawY = lastRawY = window.scrollY || 0; vy = rawY;
+    render(vy);
   } else {
     layout();
   }
-  requestAnimationFrame(raf);
+  rafId = requestAnimationFrame(frame);
 
   // PATCH 1: a small public API so the page's own menu can drive the flight.
   return {
     sectionIds: SECTIONS.map(s => s.id),
-    // Accepts a section index or id. `instant` skips smooth scrolling (deep links).
+    // Accepts a section index or id. PATCH 19: fades to the stop; `instant` moves
+    // there at once (deep links on load).
     jumpTo(target, opts) {
       const i = typeof target === 'number' ? target : SECTIONS.findIndex(s => s.id === target);
       if (i < 0 || i >= N) return false;
-      const smoothScroll = !(opts && opts.instant) && !reduce;
-      window.scrollTo({ top: jumpTarget(i), behavior: smoothScroll ? 'smooth' : 'auto' });
+      if (opts && opts.instant) {
+        cancelSnap(); jump = null; setVeil(0);
+        window.scrollTo(0, Math.round(jumpTarget(i)));
+        rawY = lastRawY = window.scrollY || 0; vy = rawY; vel = 0; dirty = true;
+      } else startJump(i);
       return true;
+    },
+    // PATCH 20: pause the snap while something covers the page (e.g. a menu).
+    setSnap(enabled) { snapEnabled = !!enabled; if (!enabled) cancelSnap(); },
+    // PATCH 1: stop the loop, remove the listeners and media, empty the container
+    // (client-side routers, hot reload, StrictMode double mounts).
+    destroy() {
+      if (stopped) return;
+      stopped = true;
+      cancelAnimationFrame(rafId);
+      offs.forEach(off => off());
+      if (inflight) {
+        inflight.aborted = true;
+        clearTimeout(inflight.timer);
+        if (inflight.ctrl) inflight.ctrl.abort();
+        inflight = null;
+      }
+      SEGMENTS.forEach(s => { if (s.video) { s.video.removeAttribute('src'); try { s.video.load(); } catch (e) {} } });
+      blobUrls.forEach(u => URL.revokeObjectURL(u));
+      container.innerHTML = '';
+      container.classList.remove('sw-root');
     },
   };
 
@@ -559,7 +903,9 @@ function injectCSS() {
   .sw-stage{position:fixed;inset:0;z-index:10;pointer-events:none;}
   .sw-scene{position:absolute;inset:0;opacity:0;overflow:hidden;will-change:opacity;}
   .sw-scene__video,.sw-scene__still{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 42%;}
-  .sw-scene__still{will-change:transform;} .sw-scene.has-clip .sw-scene__still{opacity:0;} .sw-scene__video{z-index:1;}
+  .sw-scene__still{will-change:transform;} .sw-scene__video{z-index:1;opacity:0;transition:opacity .25s linear;}
+  .sw-scene.has-clip .sw-scene__video{opacity:1;} .sw-scene.has-clip .sw-scene__still{visibility:hidden;transition:visibility 0s .3s;}
+  .sw-veil{position:fixed;inset:0;z-index:35;background:var(--sw-bg);opacity:0;pointer-events:none;}
   .sw-copylayer{position:fixed;inset:0;z-index:20;pointer-events:none;}
   .sw-copylayer::before{content:"";position:absolute;inset:0;width:min(58vw,780px);background:linear-gradient(90deg,var(--sw-bg) 0%,color-mix(in srgb,var(--sw-bg) 82%,transparent) 34%,color-mix(in srgb,var(--sw-bg) 40%,transparent) 62%,transparent 100%);}
   .sw-copy{position:absolute;left:clamp(18px,5vw,64px);top:50%;transform:translateY(calc(-50% + var(--sw-copy-dy,0vh)));width:min(42vw,460px);opacity:0;will-change:opacity,transform;}

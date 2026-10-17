@@ -7,10 +7,13 @@
 // Re-run it whenever a clip in public/media/clips/ changes.
 //
 // How: ffmpeg measures how much the picture changes between consecutive frames
-// (mean absolute difference, grayscale, 320 px wide) on the phone encodes. The
-// cumulative motion, blended with plain time, gives where each moment of the
-// clip should fall along the scroll; a trapezoid ease (velocity ramps over the
-// first and last RAMP of the band) brings the speed to zero at both ends.
+// (mean absolute difference, grayscale, 320 px wide) on the desktop encodes. A
+// light blur first keeps compression noise (which jumps at every keyframe) from
+// counting as motion: with it, the tables come out within 0.4 % of the same
+// measurement on the raw, unencoded clips. The cumulative motion, blended with
+// plain time, gives where each moment of the clip should fall along the scroll;
+// a trapezoid ease (velocity ramps over the first and last RAMP of the band)
+// brings the speed to zero at both ends.
 
 import { execFileSync } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
@@ -22,14 +25,14 @@ const CLIPS = ['c1', 'c2', 'c3', 'c4'];
 const ALPHA = 0.75; // weight of measured motion vs plain time (1 = motion only)
 const FLOOR = 0.25; // fraction of the mean motion added to every frame, so still parts still advance
 const RAMP = 0.12; // share of the band used to accelerate (and, at the end, to brake)
-const SAMPLES = 33; // table resolution; the engine interpolates linearly between samples
+const SAMPLES = 65; // table resolution; the engine interpolates linearly between samples
 
 function frameMotion(file) {
   const out = execFileSync(
     'ffmpeg',
     [
       '-v', 'error', '-i', file,
-      '-vf', 'scale=320:-2,format=gray,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-',
+      '-vf', 'scale=320:-2,format=gray,gblur=sigma=1.5,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-',
       '-f', 'null', '-',
     ],
     { encoding: 'utf8', maxBuffer: 1 << 24 },
@@ -66,7 +69,7 @@ function timeMap(motion) {
 
 const maps = {};
 for (const clip of CLIPS) {
-  const file = path.join(ROOT, 'public/media/clips', `${clip}-m.mp4`);
+  const file = path.join(ROOT, 'public/media/clips', `${clip}.mp4`);
   const motion = frameMotion(file);
   maps[clip] = timeMap(motion);
   const mean = motion.reduce((a, b) => a + b, 0) / motion.length;
